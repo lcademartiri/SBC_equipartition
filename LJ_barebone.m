@@ -49,6 +49,7 @@ C.hydrationlayer=2.5e-10;
 
 P.allpos=1;
 P.ghostghost=1;
+P.onlycorr=true;
 P.io_enabled=true;
 P.correctionwindow=0; % window of the correction; 0 = no correction, 1e6 = S.rc, any other value X=X*S.rp;
 P.convergencemode=1; % 1  by step numbers, 2 by coll numbers, 3 by coll rates convergence
@@ -59,7 +60,7 @@ P.rfstepsforeffdiffest=10000; % number of random walk steps that I need to colle
 %% SIMULATION PARAMETERS
 
 P.nodisp=1e7;  % size of displacement library
-P.reps=1; % number of replicates
+P.reps=100; % number of replicates
 P.maxcoll=1e7; % minimum number of collisions to measure
 P.maxsteps=1e6; % maximum number of steps to make when doing pdfs
 P.kuhnmultiplier=200; % multiplier of taur that is used to either include or exclude persistence
@@ -78,10 +79,10 @@ V.solvent_list=[1]; % list of solvents according to the library above
 V.phase_list=[2]; % list of phases according to the library above
 V.r_range=[1e-08,1e-8,1,1]; % min, max, steps of particle radii, then log switch (1 if logscale)
 V.N_range=[1e3,1e3,1,1]; % min, max, steps of particle numbers, then log switch (1 if logscale)
-V.phi_range=[1e-3,0.40,5,1]; % min, max, steps of volume fractions, then log switch (1 if logscale)
+V.phi_range=[0.1,0.5,5,2]; % min, max, steps of volume fractions, then log switch (1 if logscale)
 V.bc_range=[1,1,1]; % min, max, steps of boundary conditions (1:SBC; 2:PBC_cubic; 3:PBC_fcc; 4:BB)
 V.bbm_range=[1,1,1]; % big box multiplier
-V.LJpot_range=[1,1,1]; % LJ potential trigger (0 = HS; 1 = LJ; 2 = WCA)
+V.LJpot_range=[1,2,2]; % LJ potential trigger (0 = HS; 1 = LJ; 2 = WCA)
 V.T_range=[298.15,298.15,1]; % min, max, steps of temperatures
 
 V.assumptions(1)=1; % exclude those where the Kuhn time is smaller than the trajectory step time
@@ -89,6 +90,7 @@ V.assumptions(2)=1; % exclude those where the particle is smaller than the solve
 V.assumptions(3)=1; % exclude those where the particle is lighter than the solvent
 
 [V,CONDS]=simconditions_LJ(V,C,P);
+
 
 %% EFFECTIVE DIFFUSIVITY CALCULATION
 
@@ -98,7 +100,8 @@ CONDS=effective_diffusivity(data_folder,CONDS,P,C);
 
 %% SIMULATION EXECUTION
 
-for ic=5
+for ic=[1,7,8,9]
+    ic=7;
 
     if CONDS.alpha(ic,1)==0
         continue
@@ -193,21 +196,23 @@ for ic=5
         % ---
 
         % --- chunking
-        chunk_size = 1e4;
-        num_chunks = ceil(P.maxsteps / chunk_size);
-        if S.bc==1
-            m.POS = zeros(2*S.N, 3, P.maxsteps, 'single');
-            pos_buffer = zeros(2*S.N, 3, chunk_size, 'single');
-        else
-            m.POS = zeros(S.N, 3, P.maxsteps, 'single');
-            pos_buffer = zeros(S.N, 3, chunk_size, 'single');
+        if ~P.onlycorr
+            chunk_size = 1e4;
+            num_chunks = ceil(P.maxsteps / chunk_size);
+            if S.bc==1
+                m.POS = zeros(2*S.N, 3, P.maxsteps, 'single');
+                pos_buffer = zeros(2*S.N, 3, chunk_size, 'single');
+            else
+                m.POS = zeros(S.N, 3, P.maxsteps, 'single');
+                pos_buffer = zeros(S.N, 3, chunk_size, 'single');
+            end
+            m.S = S;
+            m.V = V;
+            m.P = P;
+            m.C = C;
+            m.ic = ic;
+            buffer_idx = 1;
         end
-        m.S = S;
-        m.V = V;
-        m.P = P;
-        m.C = C;
-        m.ic = ic;
-        buffer_idx = 1;
         % ---
 
         % ---- CALCULATION OF DISPLACEMENT LIBRARIES ----
@@ -225,11 +230,79 @@ for ic=5
             if S.potential==1, potname='lj'; elseif S.potential==2, potname='wca'; else potname='hs'; end
             filestartingconfiguration = sprintf('START_SBC_%s_%.0e_%.0e_%.0f_%.1f_%.1e.mat',...
                         potname,S.rp,S.phi,S.N,S.pot_epsilon/S.kbT,S.pot_sigma);
-            if exist(filestartingconfiguration,'file')
+            filenamecorrection = sprintf(['ASYMCORR__%s_%.0e_%.0e_%.0f_%.1f_%.1e.mat'],...
+                        potname,S.rp,S.phi,S.N,S.pot_epsilon/S.kbT,S.pot_sigma);
+            if exist(filestartingconfiguration,'file') && exist(filenamecorrection,'file')
                 load(filestartingconfiguration,'p','pgp')
+                load(filenamecorrection,'ASYMCORR')
             else
-                PDF=pdf_initialization(S,P,data_folder);
-                [p,pgp]=sbc_setup_sgd_v9(S,PDF,[],data_folder);
+                if S.pot_corr==0
+                    [p,pgp]=sgd_ndens_metric(S,[],data_folder);
+                else
+                    % ---------------------------------------------------------
+                    % 2. HYPERPARAMETER SAMPLING FOR ML GENERATION
+                    % ---------------------------------------------------------
+                    % We define 'opts' here to stress-test the engine
+                    
+                    opts = struct();
+                    opts.base_gain = 0.5;
+                    opts.sgd_smooth_win = 5;
+                    opts.sgd_cap = 0.003 * S.rp; 
+                    opts.clip_frac = 0.3; 
+                    opts.abs_cap_frac = 0.005;
+                    opts.rms_tolerance = 1.2; 
+                    opts.consecutive_passes = 3; 
+                    opts.stage1_grace_batches = 25;
+                    opts.stage_grace_batches = 3;
+                    opts.max_batch_size = 100000;
+                    opts.max_stage_batches = 15;
+                    opts.snr_target = 5.0;
+                    opts.n_min = 20;
+                    opts.use_soft_snr = true;
+                    opts.debugging = false;
+                    opts.graphing = true;
+                    opts.enable_io = true;
+                    opts.metric_smoothing_param = 0.8;
+                    if irep>1
+                        % A. Randomize Gain (e.g., 0.1 to 1.0)
+                        opts.base_gain = 10^(-1.3 + (1.3 * rand()));
+                        % B. Temporal Smoothing (Metric Stability) - NEW!
+                        % Randomly picks between 0.6 (fast reaction) and 0.95 (very stable/high lag)
+                        opts.metric_smoothing_param = 0.6 + (0.35 * rand());
+                        % C. Randomize Smoothing Window (sensitivity)
+                        opts.sgd_smooth_win = randi([3, 9]);                       
+                        % --- UPDATED CAP RANDOMIZATION (Weighted distribution) ---
+                        % Base: 0.3% | Max: 5.0% | Distribution: Cubic (Skewed to low values)
+                        % 50% of runs < 0.9% Cap. Only 1% of runs > 4.8% Cap.
+                        base_cap = 0.003;
+                        max_cap  = 0.050;
+                        opts.sgd_cap = S.rp * (base_cap + (max_cap - base_cap) * (rand()^3));  
+                        % E. Generate Unique Series Name to prevent overwrites
+                        % Include random ID so every run is unique for the database
+                        run_id = randi(100000);
+                        opts.series_name = sprintf('ML_Train_Cond%d_Rep%d', ic, irep);                        
+                    end
+                    opts.series_name = sprintf('ML_Train_Cond%d_Rep%d', ic, irep); 
+                    try
+                        [p,pgp,sgd_correction,sgd_edges,history] = sgd_ndens_metric_v2(S,opts,data_folder);
+                    catch ME
+                         % --- FAILURE HANDLING ---
+                         fprintf('!!! CRASH in Rep %d !!!\n', irep);
+                         fprintf('    Error: %s\n', ME.message);
+                         fprintf('    Skipping to next replicate...\n');
+                         
+                         % [CRASH REPORT] Save the parameters that caused the crash
+                         % This is CRITICAL for your ML model to learn "what not to do"
+                         crash_file = strrep(ml_data_file, '.mat', '_CRASH.mat');
+                         crash_data = struct('opts', opts, 'error_msg', ME.message, 'stack', ME.stack);
+                         save(crash_file, 'crash_data');
+                         
+                         continue; % IMMEDIATELY jump to the next
+                    end
+                end
+            end
+            if P.onlycorr
+                break
             end
             disp('initial particle configuration - determined')
             if S.pot_corr,disp('radial displacement asymmetry - determined'); end
