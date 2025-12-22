@@ -1,4 +1,4 @@
-function [p,pgp,sgd_correction,sgd_edges,history] = sbc_setup_sgd_v9(S,PDF,opts,data_folder)
+function [p,pgp,sgd_correction,sgd_edges,history] = sgd_pdf_metric(S,PDF,opts,data_folder)
 % SBC_SETUP_SGD_V9 (The "Sawtooth" Annealer)
 %
 % Logic:
@@ -54,7 +54,11 @@ base_batch_size = max( ceil(10 * relaxsteps), 2000 );
 
 % -------------------- 3. Filenames & Resume -----------------------
 if S.potential==1, potname='lj'; elseif S.potential==2, potname='wca'; else potname='hs'; end
-seriesname = 'sgd_v8_anneal';
+if isfield(opts, 'series_name')
+    seriesname = opts.series_name; % Uses the Unique ID from barebones (e.g., Rep1, Rep2)
+else
+    seriesname = 'sgd_anneal';
+end
 filenamecorrection = sprintf(['ASYMCORR_',seriesname,'_%s_%.0e_%.0e_%.0f_%.1f_%.1e.mat'],...
     potname,S.rp,S.phi,S.N,S.pot_epsilon/S.kbT,S.pot_sigma);
 filestartingconfiguration = sprintf(['START_SBC_%s_%.0e_%.0e_%.0f_%.1f_%.1e.mat'],...
@@ -93,7 +97,9 @@ disp('Creating initial FCC-like lattice...');
 flag = 1;
 if debugging, rng(100); end
 while flag==1
-    basis=[0,0.7071,0.7071;0.7071,0,0.7071;0.7071,0.7071,0].*(2.01*S.rp);
+    % --- INFLATION FIX (Essential for Gas) ---
+    lattice_scale = max(1, (0.50 / S.phi)^(1/3));
+    basis=[0,0.7071,0.7071;0.7071,0,0.7071;0.7071,0.7071,0].*(2.01 * S.rp * lattice_scale);
     maxsteps=2*ceil(((S.br*2)*sqrt(3))/(2*S.rp));
     templist=double(linspace(-maxsteps,maxsteps,2*maxsteps+1)');
     [x1,x2,x3] = meshgrid(templist,templist,templist);
@@ -218,7 +224,7 @@ while true
     % --- Physics: Potentials & Displacement ---
     if S.potential ~= 0
         ptemp = [p; pgp(idxgp,:)];
-        all_potdisps = potential_displacements_v2(ptemp, S, H, H_interpolant, 0);
+        all_potdisps = potential_displacements_v13(ptemp, S, H, H_interpolant, 1);
         potdisps = all_potdisps(1:S.N, :);
         potdispsgp = all_potdisps(S.N+1:end, :);
         draw=randi(1e6,[S.N 1]);
@@ -591,9 +597,10 @@ while true
 end
 
 ASYMCORR.correction = [sgd_centers, sgd_correction];
+ASYMCORR.history = history; ASYMCORR.sgd_edges = sgd_edges; ASYMCORR.S=S; ASYMCORR.opts=opts;
 if enable_io
-    save(filenamecorrection, 'ASYMCORR', 'sgd_edges');
-    save(filestartingconfiguration, 'p', 'pgp', 'S');
+    save([data_folder,'\',filenamecorrection], 'ASYMCORR', 'sgd_edges');
+    save([data_folder,'\',filestartingconfiguration], 'p', 'pgp', 'S');
 end
-disp('SGD V8 Complete.');
+disp('SGD V10 Complete.');
 end

@@ -101,7 +101,7 @@ CONDS=effective_diffusivity(data_folder,CONDS,P,C);
 %% SIMULATION EXECUTION
 
 for ic=[1,7,8,9]
-    ic=7;
+    ic=2;
 
     if CONDS.alpha(ic,1)==0
         continue
@@ -249,8 +249,7 @@ for ic=[1,7,8,9]
                     opts.sgd_smooth_win = 5;
                     opts.sgd_cap = 0.003 * S.rp; 
                     opts.clip_frac = 0.3; 
-                    opts.abs_cap_frac = 0.005;
-                    opts.rms_tolerance = 1.2; 
+                    opts.abs_cap_frac = 0.005; 
                     opts.consecutive_passes = 3; 
                     opts.stage1_grace_batches = 25;
                     opts.stage_grace_batches = 3;
@@ -271,12 +270,14 @@ for ic=[1,7,8,9]
                         opts.metric_smoothing_param = 0.6 + (0.35 * rand());
                         % C. Randomize Smoothing Window (sensitivity)
                         opts.sgd_smooth_win = randi([3, 9]);                       
-                        % --- UPDATED CAP RANDOMIZATION (Weighted distribution) ---
+                        % D. CAP RANDOMIZATION (Weighted distribution) ---
                         % Base: 0.3% | Max: 5.0% | Distribution: Cubic (Skewed to low values)
                         % 50% of runs < 0.9% Cap. Only 1% of runs > 4.8% Cap.
                         base_cap = 0.003;
                         max_cap  = 0.050;
-                        opts.sgd_cap = S.rp * (base_cap + (max_cap - base_cap) * (rand()^3));  
+                        opts.sgd_cap = S.rp * (base_cap + (max_cap - base_cap) * (rand()^3));
+                        % E. Randomize SNR Target between 1.5 (Aggressive/Noisy) and 6.0 (Conservative)
+                        opts.snr_target = 1.5 + (4.5 * rand());
                         % E. Generate Unique Series Name to prevent overwrites
                         % Include random ID so every run is unique for the database
                         run_id = randi(100000);
@@ -284,7 +285,9 @@ for ic=[1,7,8,9]
                     end
                     opts.series_name = sprintf('ML_Train_Cond%d_Rep%d', ic, irep); 
                     try
-                        [p,pgp,sgd_correction,sgd_edges,history] = sgd_ndens_metric_v2(S,opts,data_folder);
+                        PDF=pdf_initialization(S,P,data_folder);
+                        [p,pgp,sgd_correction,sgd_edges,history] = sgd_pdf_metric(S,PDF,opts,data_folder);
+                        %[p,pgp,sgd_correction,sgd_edges,history] = sgd_ndens_metric_v2(S,opts,data_folder);
                     catch ME
                          % --- FAILURE HANDLING ---
                          fprintf('!!! CRASH in Rep %d !!!\n', irep);

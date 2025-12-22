@@ -1,4 +1,4 @@
-function [p,pgp,sgd_correction,sgd_centers,history] = sgd_ndens_metricv2(S,opts,data_folder)
+function [p,pgp,sgd_correction,sgd_centers,history] = sgd_ndens_metric_v2(S,opts,data_folder)
 % SBC_SETUP_SGD_V11 (Targeted Metric & RMS Convergence)
 
 if nargin < 3, opts = struct(); end
@@ -112,7 +112,7 @@ history = struct('steps',[],'dens_dev',[],'dens_smooth',[],'max_corr',[],'gain',
     'batch_size',[],'fraction_updated',[],'median_snr',[]);
 
 if graphing && S.pot_corr
-    ndens.edges = sort((S.br:-0.02*S.rp:(S.br - potdepth))');
+    ndens.edges = sort((S.br:-0.02*S.rp:0)');
     ndens.centers = ndens.edges(1:end-1) + diff(ndens.edges)/2;
     ndens.counts = zeros(numel(ndens.centers),1);
     ndens.vols = (4/3)*pi*(ndens.edges(2:end).^3 - ndens.edges(1:end-1).^3);
@@ -134,7 +134,7 @@ end
 % -------------------- 7. Main Loop -----------------------------------------
 qs = 0; thermflag = 0;
 % Corrected R2 for Excluded Volume
-r2_uniform = 3/5 * (S.br - S.rp)^2; 
+r2_uniform = 3/5 * (S.br)^2; 
 
 pgp = p - (2*S.br).*(p ./ (vecnorm(p,2,2) + eps));
 reverseStr = '';
@@ -155,6 +155,11 @@ while true
 
     if thermflag == 0
         spread_ratio = mean(prho.^2) / r2_uniform;
+        % test(qs,1)=spread_ratio;
+        % if mod(qs,1000)==0
+        %     plot(test(:,end),YDataSource = 'test(:,end)');
+        %     drawnow
+        % end
         is_expanded = spread_ratio > 0.95; % Inflated lattice should pass this
         is_relaxed = qs > min_therm_steps;
         if is_relaxed && is_expanded
@@ -170,7 +175,7 @@ while true
     % Physics & Displacements (Standard)
     if S.potential ~= 0
         ptemp = [p; pgp(idxgp,:)];
-        all_potdisps = potential_displacements_v2(ptemp, S, H, H_interpolant, 0);
+        all_potdisps = potential_displacements_v13(ptemp, S, H, H_interpolant, 1);
         potdisps = all_potdisps(1:S.N, :);
         potdispsgp = all_potdisps(S.N+1:end, :);
         draw=randi(1e6,[S.N 1]); v_rand = DISP(draw, :);
