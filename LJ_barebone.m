@@ -15,8 +15,8 @@ elseif exist('G:\My Drive\LCL\Ludovico Cademartiri\Work\projects\ARBD\database',
 elseif exist('D:\GDrive\LCL\Ludovico Cademartiri\Work\projects\ARBD\database','dir')
     data_folder = 'D:\GDrive\LCL\Ludovico Cademartiri\Work\projects\ARBD\database';
 end
-if exist('D:\OneDrive - Università degli Studi di Parma\Manuel Dedola\outlines\spherical boundary conditions for brownian dynamics simulations\submissions\JChemPhys\revision\code\freeghost_nocorr','dir')
-    output_folder='D:\OneDrive - Università degli Studi di Parma\Manuel Dedola\outlines\spherical boundary conditions for brownian dynamics simulations\submissions\JChemPhys\revision\code\freeghost_nocorr';
+if exist('G:\My Drive\LCL\Lab\outlines\SBC boundary correction\data','dir')
+    output_folder='G:\My Drive\LCL\Lab\outlines\SBC boundary correction\data';
 elseif exist('C:\Users\lcade\OneDrive - Università degli Studi di Parma\Manuel Dedola\outlines\spherical boundary conditions for brownian dynamics simulations\submissions\JChemPhys\revision\code\freeghost_nocorr','dir')
     output_folder='C:\Users\lcade\OneDrive - Università degli Studi di Parma\Manuel Dedola\outlines\spherical boundary conditions for brownian dynamics simulations\submissions\JChemPhys\revision\code\freeghost_nocorr';
 elseif exist('D:\OneDrive - Università degli Studi di Parma\Manuel Dedola\outlines\spherical boundary conditions for brownian dynamics simulations\submissions\JChemPhys\revision\code\freeghost_nocorr','dir')
@@ -27,6 +27,10 @@ toolbox_folder = '..\ARBD_toolbox';
 addpath(data_folder)
 addpath(toolbox_folder)
 addpath(output_folder)
+utilities_folder =  fullfile('..', '..', 'Utilities');
+utilities_folder = genpath(utilities_folder);
+addpath(utilities_folder)
+cmaplibrary=loadColormaps();
 
 %% SERIES NAME
 
