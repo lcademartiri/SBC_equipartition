@@ -101,7 +101,7 @@ CONDS=effective_diffusivity(data_folder,CONDS,P,C);
 %% SIMULATION EXECUTION
 
 for ic=[1,7,8,9]
-    ic=2;
+    ic=7;
 
     if CONDS.alpha(ic,1)==0
         continue
