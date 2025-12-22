@@ -1,0 +1,16 @@
+# MATLAB autosave and backup files
+*.asv
+*.bak
+
+# Simulation output data
+*.mat
+*.dat
+*.log
+
+# Generated figures
+*.png
+*.pdf
+*.jpg
+
+# txt files
+*.txt
