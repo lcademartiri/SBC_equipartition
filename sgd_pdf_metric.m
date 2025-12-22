@@ -153,6 +153,11 @@ is_frozen_production = false;
 % Thermalization check
 % tightened thermalization: require 10 * relaxsteps or minimum 2000
 min_therm_steps = max( ceil(10 * relaxsteps), 2000 );
+% --- PDF-based thermalization tracking ---
+therm_pdf_passes = 0;
+required_therm_passes = 3;
+prev_pdf_rms = inf;
+
 
 % Diagnostics
 pdf_metric = 0;
@@ -206,20 +211,58 @@ while true
     pvers = p ./ (prho + eps);
     idxgp = prho > (S.br - S.rc);
 
-    % --- Thermalization Check ---
-    if thermflag == 0
-        spread_ratio = mean(prho.^2) / r2_uniform;
-        is_expanded = spread_ratio > 0.95;
-        is_relaxed = qs > min_therm_steps;
-        if is_relaxed && is_expanded
-            thermflag = 1; qs = 1;
-            disp('--- Thermalization complete ---');
-            if ~S.pot_corr
-                if enable_io,save([data_folder,'\',filestartingconfiguration], 'p', 'pgp', 'S');end
-                return
+    % --- PDF-based Thermalization Check ---
+    if thermflag == 0 && qs > min_therm_steps
+    
+        % Accumulate PDF statistics (already done above)
+        w_count = max(1, sum(pdf.pre.counts));
+    
+        curr_g = (pdf.pre.counts / w_count) ./ gdenominator;
+    
+        valid_pdf_mask = PDF.centers{3} > 2*(S.br - potdepth) & ...
+                         PDF.centers{3} < 2*S.br - S.rp;
+    
+        if any(valid_pdf_mask)
+    
+            residuals = curr_g(valid_pdf_mask) - 1;
+            pdf_rms = sqrt(mean(residuals.^2));
+    
+            expected_counts = gdenominator(valid_pdf_mask) * w_count;
+            expected_counts(expected_counts == 0) = inf;
+            sigma_pdf = sqrt(mean(1 ./ expected_counts));
+    
+            % --- Thermalization criteria ---
+            rms_ok   = pdf_rms < 3 * sigma_pdf;
+            drift_ok = abs(pdf_rms - prev_pdf_rms) < 1.0 * sigma_pdf;
+    
+            if rms_ok && drift_ok
+                therm_pdf_passes = therm_pdf_passes + 1;
+            else
+                therm_pdf_passes = 0;
+            end
+    
+            prev_pdf_rms = pdf_rms;
+    
+            if therm_pdf_passes >= required_therm_passes
+                thermflag = 1;
+                qs = 1;
+    
+                % Reset accumulators cleanly
+                pdf.pre.counts(:) = 0;
+                ndens.counts(:) = 0;
+    
+                disp('--- PDF-based thermalization complete ---');
+    
+                if ~S.pot_corr
+                    if enable_io
+                        save([data_folder,'\',filestartingconfiguration], 'p', 'pgp', 'S');
+                    end
+                    return
+                end
             end
         end
     end
+
 
     % --- Physics: Potentials & Displacement ---
     if S.potential ~= 0
