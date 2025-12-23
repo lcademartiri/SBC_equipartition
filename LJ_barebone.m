@@ -42,7 +42,7 @@ filenamecollisionseries_temp='testing_temp_%d_%d.mat';
 C.T=298.15; %K (temperatura)
 C.kb=1.38e-23; %J*K^-1 (costante di Boltzmann)
 C.kbT=C.kb*C.T;
-C.epsilon=1*C.kbT;
+C.epsilon=2*C.kbT;
 C.hydrationlayer=2.5e-10;
 
 %% OPTIONAL SWITCHES
@@ -101,7 +101,7 @@ CONDS=effective_diffusivity(data_folder,CONDS,P,C);
 %% SIMULATION EXECUTION
 
 for ic=[1,7,8,9]
-    ic=2;
+    ic=7;
 
     if CONDS.alpha(ic,1)==0
         continue
@@ -230,7 +230,7 @@ for ic=[1,7,8,9]
             if S.potential==1, potname='lj'; elseif S.potential==2, potname='wca'; else potname='hs'; end
             filestartingconfiguration = sprintf('START_SBC_%s_%.0e_%.0e_%.0f_%.1f_%.1e.mat',...
                         potname,S.rp,S.phi,S.N,S.pot_epsilon/S.kbT,S.pot_sigma);
-            filenamecorrection = sprintf(['ASYMCORR__%s_%.0e_%.0e_%.0f_%.1f_%.1e.mat'],...
+            filenamecorrection = sprintf(['ASYMCORR2eps__%s_%.0e_%.0e_%.0f_%.1f_%.1e.mat'],...
                         potname,S.rp,S.phi,S.N,S.pot_epsilon/S.kbT,S.pot_sigma);
             if exist(filestartingconfiguration,'file') && exist(filenamecorrection,'file')
                 load(filestartingconfiguration,'p','pgp')
@@ -296,9 +296,9 @@ for ic=[1,7,8,9]
                          
                          % [CRASH REPORT] Save the parameters that caused the crash
                          % This is CRITICAL for your ML model to learn "what not to do"
-                         crash_file = strrep(ml_data_file, '.mat', '_CRASH.mat');
-                         crash_data = struct('opts', opts, 'error_msg', ME.message, 'stack', ME.stack);
-                         save(crash_file, 'crash_data');
+                         % crash_file = strrep(ml_data_file, '.mat', '_CRASH.mat');
+                         % crash_data = struct('opts', opts, 'error_msg', ME.message, 'stack', ME.stack);
+                         % save(crash_file, 'crash_data');
                          
                          continue; % IMMEDIATELY jump to the next
                     end
