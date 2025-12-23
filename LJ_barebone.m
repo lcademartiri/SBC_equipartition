@@ -42,7 +42,7 @@ filenamecollisionseries_temp='testing_temp_%d_%d.mat';
 C.T=298.15; %K (temperatura)
 C.kb=1.38e-23; %J*K^-1 (costante di Boltzmann)
 C.kbT=C.kb*C.T;
-C.epsilon=2*C.kbT;
+C.epsilon=1*C.kbT;
 C.hydrationlayer=2.5e-10;
 
 %% OPTIONAL SWITCHES
@@ -101,7 +101,7 @@ CONDS=effective_diffusivity(data_folder,CONDS,P,C);
 %% SIMULATION EXECUTION
 
 for ic=[1,7,8,9]
-    ic=7;
+    ic=2;
 
     if CONDS.alpha(ic,1)==0
         continue
@@ -182,6 +182,7 @@ for ic=[1,7,8,9]
 
     % --- loop over replicates
     for irep=1:P.reps % loop over replicates 
+        close all
 
         % --- filename    
         filename=sprintf(filenamecollisionseries,ic,irep);
@@ -236,8 +237,9 @@ for ic=[1,7,8,9]
                 load(filestartingconfiguration,'p','pgp')
                 load(filenamecorrection,'ASYMCORR')
             else
+				PDF=pdf_initialization(S,P,data_folder);
                 if S.pot_corr==0
-                    [p,pgp]=sgd_ndens_metric(S,[],data_folder);
+                    [p,pgp]=sgd_pdf_metric(S,PDF,H,H_interpolant,[],data_folder);
                 else
                     % ---------------------------------------------------------
                     % 2. HYPERPARAMETER SAMPLING FOR ML GENERATION
@@ -285,8 +287,8 @@ for ic=[1,7,8,9]
                     end
                     opts.series_name = sprintf('ML_Train_Cond%d_Rep%d', ic, irep); 
                     try
-                        PDF=pdf_initialization(S,P,data_folder);
-                        [p,pgp,sgd_correction,sgd_edges,history] = sgd_pdf_metric(S,PDF,opts,data_folder);
+                        
+                        [p,pgp,ASYMCORR] = sgd_pdf_metric(S,PDF,H,H_interpolant,opts,data_folder);
                         %[p,pgp,sgd_correction,sgd_edges,history] = sgd_ndens_metric_v2(S,opts,data_folder);
                     catch ME
                          % --- FAILURE HANDLING ---

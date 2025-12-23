@@ -1,4 +1,4 @@
-function [p,pgp,sgd_correction,sgd_centers,history] = sgd_ndens_metric(S,opts,data_folder)
+function [p,pgp,ASYMCORR] = sgd_ndens_metric(S,opts,data_folder)
 % SBC_SETUP_SGD_V9 (The "Sawtooth" Annealer)
 %
 % Logic:

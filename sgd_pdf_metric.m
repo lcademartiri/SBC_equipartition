@@ -1,5 +1,5 @@
-function [p,pgp,sgd_correction,sgd_edges,history] = sgd_pdf_metric(S,PDF,opts,data_folder)
-% SBC_SETUP_SGD_V9 (The "Sawtooth" Annealer)
+function [p,pgp,ASYMCORR] = sgd_pdf_metric(S,PDF,H,H_interpolant,opts,data_folder)
+% SGD_PDF_METRIC (The "Sawtooth" Annealer)
 %
 % Logic:
 % 1. Search Phase: Starts at base_batch_size (physically derived).
@@ -11,7 +11,10 @@ function [p,pgp,sgd_correction,sgd_edges,history] = sgd_pdf_metric(S,PDF,opts,da
 
 if nargin < 3, opts = struct(); end
 
-% -------------------- 1. Option Parsing -----------------------
+% #################################################################################
+% -------------------- 1. PARSING OPTIONS ================-------------------------
+% #################################################################################
+
 % Dynamics & Control
 if isfield(opts,'base_gain'),            sgd_base_gain_default = opts.base_gain; else sgd_base_gain_default = 0.5; end
 if isfield(opts,'sgd_smooth_win'),       sgd_smooth_win = opts.sgd_smooth_win; else sgd_smooth_win = 5; end
@@ -25,7 +28,7 @@ if isfield(opts,'consecutive_passes'),   required_passes = opts.consecutive_pass
 if isfield(opts,'stage1_grace_batches'), stage1_grace_batches = opts.stage1_grace_batches; else stage1_grace_batches = 25; end
 if isfield(opts,'stage_grace_batches'),  stage_grace_batches = opts.stage_grace_batches; else stage_grace_batches = 3; end
 if isfield(opts,'max_batch_size'),       max_batch_size_limit = opts.max_batch_size; else max_batch_size_limit = 100000; end
-if isfield(opts,'max_stage_batches'), max_stage_batches = opts.max_stage_batches; else max_stage_batches = 15; end
+if isfield(opts,'max_stage_batches'),    max_stage_batches = opts.max_stage_batches; else max_stage_batches = 15; end
 
 % SNR & Gating
 if isfield(opts,'snr_target'),           snr_target = opts.snr_target; else snr_target = 5.0; end
@@ -39,30 +42,39 @@ if isfield(opts,'enable_io'),            enable_io = opts.enable_io; else enable
 if isfield(opts,'metric_smoothing_param'), metric_smoothing_param = opts.metric_smoothing_param; else metric_smoothing_param = 0.8; end
 
 % -------------------- 2. Derived Physical Params -----------------------
-gCS = (1 - S.phi/2) / (1 - S.phi)^3;
-diffE = S.esdiff * S.alpha / gCS;
-tau_alpha = (S.rp^2) / (6 * diffE);
-relaxsteps = ceil(tau_alpha / S.timestep);
+gCS = (1 - S.phi/2) / (1 - S.phi)^3; % Carnahan-Starling Contact Value g(sigma) - probability of finding two particles touching each other compared to an ideal gas
+diffE = S.esdiff * S.alpha / gCS; % Enskog Effective Diffusivity - how fast a particle diffuses inside a dense crowd - corrected by alpha
+tau_alpha = (S.rp^2) / (6 * diffE); % Structural relaxation time - characteristic time it takes for a particle to diffuse a distance equal to its own radius
+relaxsteps = ceil(tau_alpha / S.timestep); % Structural relaxation STEPS
+steps_for_decorrelation = ceil(5 * relaxsteps); % times for configurational memory to decay to <1% (exp(-5) = 0.006)
 
 % Noise prefactor for phi=0.4 (Crowded system correction)
-noise_prefactor = 2; 
+noise_prefactor = 2;
+% Depth of the correction 
+taper_width = 1.0 * S.rp; % width of the taper in radius units
+potdepth = S.rc+taper_width;
+if 2*S.br - 2*potdepth < 0, potdepth = S.br; end % if correction depth is larger than the domain radius, just use the domain radius 
+
 min_stage_rms = inf; % Track best performance in current stage
 
-% Base Batch: Tied to relaxation time. 
-% Minimum data required to see a statistically independent sample.
-base_batch_size = max( ceil(10 * relaxsteps), 2000 );
-
 % -------------------- 3. Filenames & Resume -----------------------
+% name the potentials
 if S.potential==1, potname='lj'; elseif S.potential==2, potname='wca'; else potname='hs'; end
+
+% name the series with the specific name passed on from opts
 if isfield(opts, 'series_name')
     seriesname = opts.series_name; % Uses the Unique ID from barebones (e.g., Rep1, Rep2)
 else
     seriesname = 'sgd_anneal';
 end
+
+% define specific names of the correction and the starting config
 filenamecorrection = sprintf(['ASYMCORR2eps_',seriesname,'_%s_%.0e_%.0e_%.0f_%.1f_%.1e.mat'],...
     potname,S.rp,S.phi,S.N,S.pot_epsilon/S.kbT,S.pot_sigma);
 filestartingconfiguration = sprintf(['START2eps_SBC_%s_%.0e_%.0e_%.0f_%.1f_%.1e.mat'],...
     potname,S.rp,S.phi,S.N,S.pot_epsilon/S.kbT,S.pot_sigma);
+	
+% load pdf denominator if available in database
 if S.bc==1
     filepdfdenom = sprintf('PDFdenom_SBC_%.0e_%.0e_%.0f.mat',S.rp,S.phi,S.N);
 elseif S.bc==2
@@ -71,13 +83,14 @@ elseif S.bc==3
     filepdfdenom = sprintf('PDFdenom_PBCFCC_%.0e_%.0e_%.0f.mat',S.rp,S.phi,S.N);
 end
 
+% if all files are already available, just load them and exit
 if enable_io && exist(filenamecorrection,'file') && exist(filestartingconfiguration,'file')
     load(filenamecorrection); load(filestartingconfiguration);
     history = [];
     return
 end
 
-% -------------------- 4. Helpers -----------------------------------
+% -------------------- PDF DENOMINATOR -----------------------------------
 if exist(filepdfdenom,'file')
     load(filepdfdenom,'gdenominator');
 else
@@ -85,199 +98,274 @@ else
     gdenominator = PDFdenom(S, PDF, 1e5); 
     if enable_io, save([data_folder,'\',filepdfdenom],'gdenominator','S'); end
 end
+% ------------------------------------------------------------------------
 
-if S.potential~=0
-    H = pot_force(S.potential,S.rc,30000,S.pot_sigma,S.pot_epsilon);
-    % clamp = mcdClamp(1e6,normrnd(0,S.stdx,1e6,3),S.esdiff,S.timestep,H(H(:,1) >= 0.8 * S.pot_sigma, :),S.kbT);
-    H_interpolant = griddedInterpolant(H(:,1), H(:,2), 'linear', 'nearest');
-end
+% #################################################################################
+% -------------------- 5. STARTING PARTICLE CONFIGURATION -------------------------
+% #################################################################################
 
-% -------------------- 5. Initial Placement -----------------------
 disp('Creating initial FCC-like lattice...');
-flag = 1;
+
 if debugging, rng(100); end
-while flag==1
-    % --- INFLATION FIX (Essential for Gas) ---
-    lattice_scale = max(1, (0.50 / S.phi)^(1/3));
-    basis=[0,0.7071,0.7071;0.7071,0,0.7071;0.7071,0.7071,0].*(2.01 * S.rp * lattice_scale);
-    maxsteps=2*ceil(((S.br*2)*sqrt(3))/(2*S.rp));
-    templist=double(linspace(-maxsteps,maxsteps,2*maxsteps+1)');
-    [x1,x2,x3] = meshgrid(templist,templist,templist);
-    possiblepositions = x1(:).*basis(1,:)+x2(:).*basis(2,:)+x3(:).*basis(3,:);
-    possiblepositions = bsxfun(@plus,possiblepositions,-S.rp*[1,1,1]./vecnorm([1,1,1],2));
-    tempnorms = vecnorm(possiblepositions,2,2);
-    possiblepositions(tempnorms > (S.br - S.rp), :) = [];
-    possiblepositions = possiblepositions(randperm(size(possiblepositions,1)), :);
-    p = possiblepositions(1:S.N, :);
-    D = pdist(p)';
-    if sum(D < (2*S.rp)) == 0, flag = 0; end
-end
-
-% -------------------- 6. SGD State Init ---------------------------------
-potdepth = 2 * S.rc;
-if 2*S.br - 2*potdepth < (10 * S.rp), potdepth = 2*S.br - 10*S.rp; end
-
-sgd_edges = sort((S.br:-0.02*S.rp:S.br - potdepth)');
-sgd_bins = numel(sgd_edges) - 1;
-sgd_centers = sgd_edges(1:end-1) + diff(sgd_edges)/2;
-% --- SPATIAL TAPER MASK (Insert here) ---
-% Force correction to 0 at the inner edge to prevent impulsive forces.
-% We calculate distance from the Inner Edge (Smallest Radius).
-r_inner_edge = min(sgd_centers) - (diff(sgd_edges(1:2))/2); 
-taper_width = 1.0 * S.rp; % Ramp over 1 particle radius
-
-taper_mask = zeros(sgd_bins, 1);
-for b = 1:sgd_bins
-    dist_from_inner = sgd_centers(b) - r_inner_edge;
-    % Linear Ramp 0 -> 1
-    taper_mask(b) = min(1, max(0, dist_from_inner / taper_width));
-end
-sgd_correction = zeros(sgd_bins, 1);
-F_corr_interp = griddedInterpolant(sgd_centers, sgd_correction, 'linear', 'nearest');
-
-batch_sum_drift = zeros(sgd_bins,1);
-batch_sum_drift_sq = zeros(sgd_bins,1);
-batch_counts = zeros(sgd_bins,1);
-steps_in_batch = 0;
-
-% --- Annealing Variables ---
-current_batch_mult = 1;
-sgd_batch_size = base_batch_size * current_batch_mult;
-sgd_base_gain = sgd_base_gain_default;
-sgd_gain = sgd_base_gain;
-rms_pass_counter = 0;
-batches_in_stage = 0; 
-stage_index = 1;
-is_frozen_production = false;
-
-% Thermalization check
-% tightened thermalization: require 10 * relaxsteps or minimum 2000
-min_therm_steps = max( ceil(10 * relaxsteps), 2000 );
-% --- PDF-based thermalization tracking ---
-therm_pdf_passes = 0;
-required_therm_passes = 3;
-prev_pdf_rms = inf;
-
-
-% Diagnostics
-pdf_metric = 0;
-
-% Plotting Init
-history = struct('steps',[],'pdf_dev',[],'pdf_smooth',[],'max_corr',[],'gain',[],...
-    'batch_size',[],'fraction_updated',[],'median_snr',[]);
-
-if graphing && S.pot_corr
-    ndens.edges = sort((S.br:-0.02*S.rp:0)');
-    ndens.centers = ndens.edges(1:end-1) + diff(ndens.edges)/2;
-    ndens.counts = zeros(numel(ndens.centers),1);
-    ndens.vols = (4/3)*pi*(ndens.edges(2:end).^3 - ndens.edges(1:end-1).^3);
-    ndens.ndens0 = (S.N / S.bv);
-    pdf.pre.counts = zeros(numel(PDF.pdfedges{3})-1,1);
-
-    f_fig = figure('Units','normalized','Position',[0.05 0.05 0.85 0.85]);
-    set(gcf,'Color','k');
-    ax_dens = subplot(3,2,1); ax_pdf  = subplot(3,2,2);
-    ax_conv = subplot(3,2,3); ax_ctrl = subplot(3,2,4);
-    ax_diag = subplot(3,2,5); ax_snr  = subplot(3,2,6);
-    axs = [ax_dens, ax_pdf, ax_conv, ax_ctrl, ax_diag, ax_snr];
-    for a = axs
-        set(a,'Color','k','XColor','w','YColor','w','LineWidth',3);
-        set(get(a,'Title'),'FontWeight','bold','Color','w');
-        set(get(a,'XLabel'),'FontWeight','bold','Color','w');
-        set(get(a,'YLabel'),'FontWeight','bold','Color','w');
-        set(a,'FontWeight','bold','FontSize',10);
+p=startingPositions_lj(S);
+% --- INSTANT THERMALIZATION (MC SHAKER) ---
+fprintf('Running Monte Carlo Shaker to erase memory...\n');
+for k = 1:1e5 
+    idx = randi(S.N);
+    trial_pos = p(idx,:) + (rand(1,3)-0.5) * S.br; 
+    % Simple Hard Sphere & Boundary Check
+    if norm(trial_pos) < (S.br)
+        % Only check neighbors if inside box
+        dists = pdist2(trial_pos, p, 'squaredeuclidean');
+        dists(idx) = inf; % Ignore self
+        if min(dists) > (2*S.rp)^2
+            p(idx,:) = trial_pos; % Accept Move
+        end
     end
 end
+pgp = p - (2*S.br).*(p ./ (vecnorm(p,2,2) + eps)); % Update ghosts
+% ------------------------------------------
 
-% -------------------- 7. Main Loop -----------------------------------------
-qs = 0;
-thermflag = 0;
-r2_uniform = 3/5 * S.br^2;
-pgp = p - (2*S.br).*(p ./ (vecnorm(p,2,2) + eps));
-reverseStr = '';
+
+% #################################################################################
+% -------------------- 6. SGD STATE INITALIZATION ---------------------------------
+% #################################################################################
 
 if S.pot_corr
-    fprintf('Starting SGD V9 (Annealing). Base Batch: %d. Gain: %.2f. Cap: %.2e\n', sgd_batch_size, sgd_base_gain, sgd_cap);
+	% --- RADIAL RANGE OF CORRECTION -----------------------
+	sgd_edges = sort((S.br:-0.05*S.rp:S.br - potdepth)'); % in two hundreths of a radius
+	sgd_bins = numel(sgd_edges) - 1;
+	sgd_centers = sgd_edges(1:end-1) + diff(sgd_edges)/2;
+	sgd_vols=(4/3)*pi*(sgd_edges(2:end)).^3 - (4/3)*pi*(sgd_edges(1:end-1)).^3;
+	
+	% --- PDF INITIALIZATION -------------------------------
+	maxdist=2*S.br;
+    if 10*S.rp>(maxdist-2*S.rc)
+        pdf.edges=sort((maxdist:-0.05*S.rp:0)'); % from 0 to box diameter
+    else
+        OS=sort((maxdist:-0.05*S.rp:(maxdist-2*S.rc))');
+        IS=(0:0.05*S.rp:10*S.rp)';
+        MS=linspace(max(IS),min(OS),ceil((min(OS)-max(IS))/S.rp))';
+        pdf.edges=unique(sort([OS;MS;IS]));
+    end
+	clear OS IS MS
+	pdf.bins = numel(pdf.edges) - 1;
+	pdf.centers = pdf.edges(1:end-1) + diff(pdf.edges)/2;
+	pdf.vols=(4/3)*pi*(pdf.edges(2:end)).^3 - (4/3)*pi*(pdf.edges(1:end-1)).^3;
+	pdf.ndens0 = (S.N / S.bv);
+    pdf.r_norm = pdf.centers / S.br; % Geometric Form Factor - Normalize distance by Box Radius (S.br)
+    pdf.geom_factor = 1 - (3/4)*pdf.r_norm + (1/16)*pdf.r_norm.^3; % The Finite Volume Correction Polynomial
+    pdf.geom_factor = max(0, pdf.geom_factor); % Clamp negative values to 0
+    pdf.ndens0 = (S.N / S.bv);
+    % Corrected Denominator (Halved for Unique Pairs)
+    pdf.denom = 0.5 * (pdf.ndens0 * pdf.geom_factor * S.N) .* pdf.vols;
+	
+	% --- STATISTICAL DETERMINATION OF MINIMUM NUMBER OF STEPS IN BATCH sdmns--------
+	% In dilute system the relaxation time could be very small leading to very small batches which could
+	% mean that many sgd bins remain empty causing problems. So we here calculate how many steps we do
+	% need to have a minimum of counts in each bin	
+	sdmns.min_counts_per_bin = 20; 	
+	sdmns.prob_hit = sgd_vols(1) / S.bv; % Probability of landing in smallest bin (assuming uniform density)	
+	sdmns.required_total_samples = sdmns.min_counts_per_bin / sdmns.prob_hit; % Required total samples = min_counts / prob_hit	
+	sdmns.steps_for_stats = ceil(sdmns.required_total_samples / S.N); % Steps needed = Samples / Number of Particles
+	base_batch_size = max(steps_for_decorrelation, sdmns.steps_for_stats);
+	fprintf('Batch Sizing:\n  Physics Decorrelation: %d steps\n Statistical Floor: %d steps\n -> Selected Batch:%d steps\n', ...
+    steps_for_decorrelation, sdmns.steps_for_stats, base_batch_size);
+
+	% --- TAPER ON CORRECTION  -----------------------------
+	% force correction to taper to zero at the inner edgee of the correction radial range to prevent impulsive forces.
+	r_inner_edge = min(sgd_edges); % inner edge of the correction radial range
+	taper_mask = zeros(sgd_bins, 1); % initialize the taper mask
+	% loop creating a linear taper starting from r_inner_edge at 0 and capping at 1 at r_inner_edge+taper_width
+	for itaper = 1:sgd_bins
+		taper_mask(itaper) = min(1, max(0, (sgd_centers(itaper) - r_inner_edge) / taper_width));
+	end
+
+	% --- INITIALIZE KEY VECTORS ---
+	sgd_correction = zeros(sgd_bins, 1);
+	batch_sum_drift = zeros(sgd_bins,1);
+	batch_sum_drift_sq = zeros(sgd_bins,1);
+	batch_counts = zeros(sgd_bins,1);
+	pdf.pre_counts = zeros(numel(pdf.edges)-1,1);
+
+	% --- INITIALIZE INTERPOLANT OF CORRECTION ---
+	F_corr_interp = griddedInterpolant(sgd_centers, sgd_correction, 'linear', 'nearest');
+
+	% --- STARTING VALUES OF ANNEALING VARIABLES  ---
+	steps_in_batch = 0; % step counter in each batch
+	current_batch_mult = 1;
+	sgd_batch_size = base_batch_size * current_batch_mult; % size of the batch
+	sgd_base_gain = sgd_base_gain_default;
+	sgd_gain = sgd_base_gain;
+	rms_pass_counter = 0;
+	batches_in_stage = 0; 
+	stage_index = 1;
+	
+	% --- FLAGS ---
+	is_frozen_production = false;
+	
+	% --- UTILITIES ---
+	reverseStr = '';
+	
+	% --- THERMALIZATION CONDITIONS ---
+	min_therm_steps = max( ceil(10 * relaxsteps), 2000 );
+	therm_pdf_passes = 0;
+	required_therm_passes = 100;
+	prev_pdf_rms = inf;
+	thermflag = 0;
+	pdf.therm_mask = pdf.centers > 2*(S.br - potdepth) & pdf.centers < 2*S.br-2*S.rp;
+    therm_block_size = max(ceil(relaxsteps), 1000);
+
+	% --- INITIALIZE DIAGNOSTIC VALUES ---
+	pdf.metric = 0;
+
+	% --- INITIALIZE HISTORY ---
+	history = struct('steps',[],'pdf_dev',[],'pdf_smooth',[],'max_corr',[],'gain',[],...
+		'batch_size',[],'fraction_updated',[],'median_snr',[]);
+	
+	% --- INITIALIZE PLOTTING AND MONITORING ----
+	if graphing 
+		% initialize number density mapping
+		ndens.edges = sort((S.br:-0.05*S.rp:0)');
+		ndens.centers = ndens.edges(1:end-1) + diff(ndens.edges)/2;
+		ndens.counts = zeros(numel(ndens.centers),1);
+		ndens.vols = (4/3)*pi*(ndens.edges(2:end).^3 - ndens.edges(1:end-1).^3);
+		ndens.ndens0 = (S.N / S.bv);
+		
+		% initialize plots and formatting
+		f_fig = figure('Units','normalized','Position',[0.05 0.05 0.85 0.85]);
+		set(gcf,'Color','k');
+		ax_dens = subplot(3,2,1); ax_pdf  = subplot(3,2,2);
+		ax_conv = subplot(3,2,3); ax_ctrl = subplot(3,2,4);
+		ax_diag = subplot(3,2,5); ax_snr  = subplot(3,2,6);
+		axs = [ax_dens, ax_pdf, ax_conv, ax_ctrl, ax_diag, ax_snr];
+		for a = axs
+			set(a,'Color','k','XColor','w','YColor','w','LineWidth',3);
+			set(get(a,'Title'),'FontWeight','bold','Color','w');
+			set(get(a,'XLabel'),'FontWeight','bold','Color','w');
+			set(get(a,'YLabel'),'FontWeight','bold','Color','w');
+			set(a,'FontWeight','bold','FontSize',10);
+		end
+	end
+end
+
+
+% #################################################################################
+% -------------------- 7. MAIN LOOP -----------------------------------------------
+% #################################################################################
+
+if S.pot_corr
+    fprintf('Starting SGD_PDF V2 (Annealing). Base Batch: %d. Gain: %.2f. Cap: %.2e\n', sgd_batch_size, sgd_base_gain, sgd_cap);
 else
     fprintf('Thermalizing structure')
 end
+
 % ---- CALCULATION OF DISPLACEMENT LIBRARIES ----
 DISP=build_noise_library(S.stdx,1e6);
-% ----
+qd=1;
+% -----------------------------------------------
+
+qs = 0; % step counter
+
 while true
-    qs = qs + 1;
-
+    qs = qs + 1; % update counter
+	% norms of real particles
     prho = vecnorm(p, 2, 2);
+	% versors of real particles
     pvers = p ./ (prho + eps);
+	% mask of ghost generators
     idxgp = prho > (S.br - S.rc);
+	% accumulate PDF statistics
+	pairdists = pdist(p);
+    [hc_pdf, ~] = histcounts(pairdists, pdf.edges); 
+    if numel(hc_pdf) == numel(pdf.pre_counts)
+        pdf.pre_counts = pdf.pre_counts + hc_pdf';
+    end
+    
+    % --- PDF-BASED THERMALIZATION CHECK ---
+    % --- 1. Define Block Size (Duration of each "Test") ---
+    % Use physics-based time or a hard floor (e.g. 500-1000 steps)
+    
 
-    % --- PDF-based Thermalization Check ---
-    if thermflag == 0 && qs > min_therm_steps
-    
-        % Accumulate PDF statistics (already done above)
-        w_count = max(1, sum(pdf.pre.counts));
-    
-        curr_g = (pdf.pre.counts / w_count) ./ gdenominator;
-    
-        valid_pdf_mask = PDF.centers{3} > 2*(S.br - potdepth) & ...
-                         PDF.centers{3} < 2*S.br - S.rp;
-    
-        if any(valid_pdf_mask)
-    
-            residuals = curr_g(valid_pdf_mask) - 1;
-            pdf_rms = sqrt(mean(residuals.^2));
-    
-            expected_counts = gdenominator(valid_pdf_mask) * w_count;
-            expected_counts(expected_counts == 0) = inf;
-            sigma_pdf = sqrt(mean(1 ./ expected_counts));
-    
-            % --- Thermalization criteria ---
-            rms_ok   = pdf_rms < 3 * sigma_pdf;
-            drift_ok = abs(pdf_rms - prev_pdf_rms) < 1.0 * sigma_pdf;
-    
-            if rms_ok && drift_ok
-                therm_pdf_passes = therm_pdf_passes + 1;
-            else
-                therm_pdf_passes = 0;
-            end
-    
-            prev_pdf_rms = pdf_rms;
-    
-            if therm_pdf_passes >= required_therm_passes
-                thermflag = 1;
-                qs = 1;
-    
-                % Reset accumulators cleanly
-                pdf.pre.counts(:) = 0;
-                ndens.counts(:) = 0;
-    
-                disp('--- PDF-based thermalization complete ---');
-    
-                if ~S.pot_corr
-                    if enable_io
-                        save([data_folder,'\',filestartingconfiguration], 'p', 'pgp', 'S');
-                    end
-                    return
-                end
+    % --- Cumulative Thermalization Check ---
+    % 1. Wait for a minimum number of steps to ensure "Inertia" builds up
+    min_stats_steps = 10000; 
+
+    if thermflag == 0 && qs > min_stats_steps
+        
+        % Cumulative Normalization (using total steps 'qs')
+        pdf.curr_g = (pdf.pre_counts / qs) ./ pdf.denom;
+        
+        % Calculate RMS on the "Bulk Mask"
+        pdf.therm_residuals = pdf.curr_g(pdf.therm_mask) - 1;
+        pdf.rms = sqrt(mean(pdf.therm_residuals.^2));
+        
+        % Calculate Noise Floor (Cumulative 'qs' makes this small, which is fine)
+        expected_counts = pdf.denom(pdf.therm_mask) * qs;
+        expected_counts(expected_counts == 0) = inf;
+        sigma_pdf = sqrt(mean(1 ./ expected_counts));
+        
+        % --- THE CRITERIA ---
+        % 1. Drift Check:
+        % Since we are averaging cumulatively, 'pdf.rms' will change VERY slowly.
+        % We demand it effectively stops changing.
+        drift_ok = abs(pdf.rms - prev_pdf_rms) < 0.001 * sigma_pdf; 
+        
+        % 2. Sanity Check:
+        % Just ensure we aren't stuck in a "Zombie" state (RMS > 0.5)
+        rms_ok = pdf.rms < 0.2; 
+        
+        % Only print every 1000 steps to avoid clutter
+        if mod(qs, 10) == 0
+             fprintf('Therm Check (Step %d): RMS=%.4f | Drift=%.1e (Tol %.1e) | Stable? %d\n', ...
+                qs, pdf.rms, abs(pdf.rms - prev_pdf_rms), 0.1*sigma_pdf, drift_ok);
+        end
+
+        if drift_ok && rms_ok
+            therm_pdf_passes = therm_pdf_passes + 1;
+        else
+            therm_pdf_passes = 0;
+        end
+        
+        prev_pdf_rms = pdf.rms;
+        
+        if therm_pdf_passes >= required_therm_passes
+            disp('--- Thermalization Complete (Cumulative Stability) ---');
+            thermflag = 1; 
+            qs = 0; 
+            pdf.pre_counts(:) = 0; % Wipe for main loop
+            ndens.counts(:) = 0;
+            
+            if ~S.pot_corr
+                if enable_io, save([data_folder,'\',filestartingconfiguration], 'p', 'pgp', 'S'); end
+                return
             end
         end
     end
 
-
-    % --- Physics: Potentials & Displacement ---
-    if S.potential ~= 0
+	% --- POTENTIALS AND DISPLACEMENTS ---
+	% collect brownian displacements
+	v_rand = DISP(qd:qd+S.N-1, :);
+	v_rand_gp = DISP(qd+S.N:qd+2*S.N-1, :);
+	qd=qd+2*S.N;
+	if qd+2*S.N>1e6
+		DISP=DISP(randperm(1e6),:);
+		qd=1;
+	end
+	
+    if S.potential ~= 0 
+		% collect potential displacements
         ptemp = [p; pgp(idxgp,:)];
         all_potdisps = potential_displacements_v13(ptemp, S, H, H_interpolant, 1);
         potdisps = all_potdisps(1:S.N, :);
         potdispsgp = all_potdisps(S.N+1:end, :);
-        draw=randi(1e6,[S.N 1]);
-        v_rand = DISP(draw, :);
+		% add brownian displacements        
         base_disp = v_rand + potdisps;
+		base_disp_gp = v_rand_gp;
+		base_disp_gp(idxgp,:)=base_disp_gp(idxgp,:)+potdispsgp;
     else
-        draw=randi(1e6,[S.N 1]);
-        v_rand = DISP(draw, :);
         base_disp = v_rand;
-        potdispsgp = zeros(sum(idxgp), 3);
+		base_disp_gp = v_rand_gp;
     end
 
     % --- Accumulation (Only after thermalization) ---
@@ -299,9 +387,9 @@ while true
             [hc, ~] = histcounts(vecnorm(p,2,2), ndens.edges);
             ndens.counts = ndens.counts + hc';
             pairdists = pdist(p);
-            [hc_pdf, ~] = histcounts(pairdists, PDF.pdfedges{3});
-            if numel(hc_pdf) == numel(pdf.pre.counts)
-                pdf.pre.counts = pdf.pre.counts + hc_pdf';
+            [hc_pdf, ~] = histcounts(pairdists, pdf.edges);
+            if numel(hc_pdf) == numel(pdf.pre_counts)
+                pdf.pre_counts = pdf.pre_counts + hc_pdf';
             end
         end
 
@@ -338,18 +426,18 @@ while true
             w_count = steps_in_batch;
             valid_pdf_mask = PDF.centers{3} > 2*(S.br - potdepth) & PDF.centers{3} < 2*(S.br)-S.rp;
             if any(valid_pdf_mask)
-                curr_g = (pdf.pre.counts / max(1,w_count)) ./ gdenominator;
+                curr_g = (pdf.pre_counts / max(1,w_count)) ./ gdenominator;
                 residuals = curr_g(valid_pdf_mask) - 1;
                 weights = gdenominator(valid_pdf_mask);
                 raw_pdf_metric = sqrt(sum(weights .* (residuals.^2)) / sum(weights));
             else
                 raw_pdf_metric = 1; 
             end
-            if pdf_metric == 0, pdf_metric = raw_pdf_metric;
-            else, pdf_metric = (1 - metric_smoothing_param) * pdf_metric + metric_smoothing_param * raw_pdf_metric;
+            if pdf.metric == 0, pdf.metric = raw_pdf_metric;
+            else, pdf.metric = (1 - metric_smoothing_param) * pdf.metric + metric_smoothing_param * raw_pdf_metric;
             end
-            if pdf_metric > 0
-                min_stage_rms = min(min_stage_rms, pdf_metric);
+            if pdf.metric > 0
+                min_stage_rms = min(min_stage_rms, pdf.metric);
             end
             
             % Dynamic Noise Floor
@@ -369,7 +457,7 @@ while true
             % --- A. UPDATE HISTORY STRUCTURE ---
             history.steps(end+1) = qs;
             history.pdf_dev(end+1) = raw_pdf_metric;
-            history.pdf_smooth(end+1) = pdf_metric;
+            history.pdf_smooth(end+1) = pdf.metric;
             history.max_corr(end+1) = max(abs(sgd_correction));
             history.gain(end+1) = sgd_gain;
             history.batch_size(end+1) = sgd_batch_size;
@@ -438,7 +526,7 @@ while true
             
             % 2. Standard RMS Check (FIXED: Uses current_grace_limit)
             if batches_in_stage > current_grace_limit
-                if pdf_metric < (rms_tolerance * current_noise_floor)
+                if pdf.metric < (rms_tolerance * current_noise_floor)
                     rms_pass_counter = rms_pass_counter + 1;
                 else
                     rms_pass_counter = 0;
@@ -498,7 +586,7 @@ while true
 
                 % 2. PDF (Top Right) -- RESTORED
                 % Calculate current g(r)
-                curr_g = (pdf.pre.counts / max(1,w_count)) ./ gdenominator;
+                curr_g = (pdf.pre_counts / max(1,w_count)) ./ gdenominator;
                 subplot(ax_pdf);
                 % Only plot valid range to avoid weird scaling
                 plot(PDF.centers{3}, curr_g, 'Color', [1 1 0], 'LineWidth', 2); 
@@ -511,7 +599,7 @@ while true
                 subplot(ax_conv);
                 yyaxis left; ax=gca; ax.YColor=[1 1 0];
                 % '.-' ensures points are visible even if it's the very first batch
-                plot(history.steps, history.pdf_smooth, '.-', 'Color',[1 1 0], 'LineWidth', 2); 
+                plot(history.steps, history.pdf.smooth, '.-', 'Color',[1 1 0], 'LineWidth', 2); 
                 ylabel('RMS');
                 yyaxis right; ax=gca; ax.YColor=[0 1 1];
                 plot(history.steps, history.max_corr, '.-', 'Color',[0 1 1], 'LineWidth', 2); 
@@ -542,14 +630,14 @@ while true
                 drawnow;
                 
                 msg = sprintf('Step %d | RMS: %.4f (Target: %.4f) | Pass: %d/%d | Gain: %.1e', ...
-                    qs, pdf_metric, rms_tolerance*current_noise_floor, rms_pass_counter, required_passes, sgd_gain);
+                    qs, pdf.metric, rms_tolerance*current_noise_floor, rms_pass_counter, required_passes, sgd_gain);
                 fprintf([reverseStr, msg]);
                 reverseStr = repmat('\b', 1, length(msg));
             end
             
             if transition_triggered && ~is_frozen_production
                 fprintf('\n=== STAGE %d COMPLETE (RMS %.4f vs Target %.4f) ===\n', ...
-                    stage_index, pdf_metric, rms_tolerance*current_noise_floor);
+                    stage_index, pdf.metric, rms_tolerance*current_noise_floor);
                 
                 % ... [Standard Snapshot Save Logic] ...
                 if enable_io
@@ -595,28 +683,41 @@ while true
             % G. Reset Accumulators
             batch_sum_drift(:) = 0; batch_sum_drift_sq(:) = 0; batch_counts(:) = 0;
             steps_in_batch = 0;
-            ndens.counts(:) = 0; pdf.pre.counts(:) = 0; 
-            if transition_triggered, pdf_metric = 0; end
+            ndens.counts(:) = 0; 
+			pdf.pre_counts(:) = 0; 
+            if transition_triggered, pdf.metric = 0; end
         end
     end
 
-    % --- Update & Apply (Every Step) ---
+    % --- UPDATE REAL PARTICLE POSITIONS --------------------
+	% get correction from interpolant and the norms 
     dr_corr_mag = F_corr_interp(prho);
-    core_mask = prho < (S.br - potdepth); dr_corr_mag(core_mask) = 0;
+	% zero out correction outside of correction depth
+    core_mask = prho < (S.br - potdepth); 
+	dr_corr_mag(core_mask) = 0;
+	% add corrections to the real particle displacements
     total_disp = base_disp + (dr_corr_mag .* pvers);
+	% get final real particle positions + norms
     p2 = p + total_disp;
+	p2rho=vecnorm(p2, 2, 2);
+	% ------------------------------------------------------
 
-    % Ghost Update (Free Tangential)
-    draw=randi(1e6,[S.N 1]);
-    v_rand_gp = DISP(draw, :);
-    if S.potential ~= 0, v_rand_gp(idxgp,:) = v_rand_gp(idxgp,:) + potdispsgp; end
-    pgp_norm = vecnorm(pgp, 2, 2) + eps;
+    % --- GHOST PROTOCOL -----------------------------------------------
+	% norms of all ghosts
+    pgp_norm = vecnorm(pgp, 2, 2) + eps; 
+	% versors of all ghosts
     pgp_dir  = pgp ./ pgp_norm;
-    v_rad_comp = sum(v_rand_gp .* pgp_dir, 2);
-    v_tan_gp   = v_rand_gp - (v_rad_comp .* pgp_dir);
+	% extract radial component of displacement
+    v_rad_comp = sum(base_disp_gp .* pgp_dir, 2);
+	% extract tangential component of displacement
+    v_tan_gp   = base_disp_gp - (v_rad_comp .* pgp_dir);
+	% move ghosts tangentially
     pgp_temp = pgp + v_tan_gp;
+	% recalculate versors
     pgp_next_dir  = pgp_temp ./ (vecnorm(pgp_temp, 2, 2) + eps);
-    pgp2  = pgp_next_dir .* (2*S.br - vecnorm(p2, 2, 2));
+	% calculate final position as tethered to updated real positions
+    pgp2  = pgp_next_dir .* (2*S.br - p2rho);
+	% -----------------------------------------------------------------
 
     % Hard Sphere Reset logic
     if S.potential == 0
@@ -630,11 +731,16 @@ while true
             pgp2(resetters, :) = pgp(resetters, :);
         end
     end
-
-    p2rho = vecnorm(p2,2,2); pgp2rho = vecnorm(pgp2,2,2);
+	
+	% --- PROMOTION AND DEMOTION --------------------------------------
+    p2rho = vecnorm(p2,2,2); 
+	pgp2rho = vecnorm(pgp2,2,2);
     idx_swap = p2rho > pgp2rho;
-    p(idx_swap,:) = pgp2(idx_swap,:); pgp(idx_swap,:) = p2(idx_swap,:);
-    p(~idx_swap,:) = p2(~idx_swap,:); pgp(~idx_swap,:) = pgp2(~idx_swap,:);
+    p(idx_swap,:) = pgp2(idx_swap,:); 
+	pgp(idx_swap,:) = p2(idx_swap,:);
+    p(~idx_swap,:) = p2(~idx_swap,:); 
+	pgp(~idx_swap,:) = pgp2(~idx_swap,:);
+	% -----------------------------------------------------------------
 
     if qs > 5e7, fprintf('Internal safety limit (5e7) reached.\n'); break; end
 end
