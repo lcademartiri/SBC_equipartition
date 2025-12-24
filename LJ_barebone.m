@@ -101,7 +101,7 @@ CONDS=effective_diffusivity(data_folder,CONDS,P,C);
 %% SIMULATION EXECUTION
 
 for ic=[1,7,8,9]
-    ic=2;
+    ic=7;
 
     if CONDS.alpha(ic,1)==0
         continue
@@ -233,7 +233,7 @@ for ic=[1,7,8,9]
                         potname,S.rp,S.phi,S.N,S.pot_epsilon/S.kbT,S.pot_sigma);
             filenamecorrection = sprintf(['ASYMCORR2eps__%s_%.0e_%.0e_%.0f_%.1f_%.1e.mat'],...
                         potname,S.rp,S.phi,S.N,S.pot_epsilon/S.kbT,S.pot_sigma);
-            if exist(filestartingconfiguration,'file') && exist(filenamecorrection,'file')
+            if 2==1 % exist(filestartingconfiguration,'file') && exist(filenamecorrection,'file')
                 load(filestartingconfiguration,'p','pgp')
                 load(filenamecorrection,'ASYMCORR')
             else
@@ -283,9 +283,9 @@ for ic=[1,7,8,9]
                         % E. Generate Unique Series Name to prevent overwrites
                         % Include random ID so every run is unique for the database
                         run_id = randi(100000);
-                        opts.series_name = sprintf('ML_Train_Cond%d_Rep%d', ic, irep);                        
+                        opts.series_name = sprintf('ML_Train_Cond%d_Rep%d', ic, run_id);                        
                     end
-                    opts.series_name = sprintf('ML_Train_Cond%d_Rep%d', ic, irep); 
+                    opts.series_name = sprintf('ML_Train_Cond%d_Rep1', ic, irep); 
                     try
                         
                         [p,pgp,ASYMCORR] = sgd_pdf_metric(S,PDF,H,H_interpolant,opts,data_folder);

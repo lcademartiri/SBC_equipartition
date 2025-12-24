@@ -75,7 +75,7 @@ end
 % define specific names of the correction and the starting config
 filenamecorrection = sprintf(['ASYMCORR2eps_',seriesname,'_%s_%.0e_%.0e_%.0f_%.1f_%.1e.mat'],...
     potname,S.rp,S.phi,S.N,S.pot_epsilon/S.kbT,S.pot_sigma);
-filestartingconfiguration = sprintf(['START2eps_SBC_%s_%.0e_%.0e_%.0f_%.1f_%.1e.mat'],...
+filestartingconfiguration = sprintf(['START2eps_SBC_',seriesname,'_%s_%.0e_%.0e_%.0f_%.1f_%.1e.mat'],...
     potname,S.rp,S.phi,S.N,S.pot_epsilon/S.kbT,S.pot_sigma);
 	
 % load pdf denominator if available in database
@@ -310,7 +310,7 @@ while true
         % 1. Drift Check:
         % Since we are averaging cumulatively, 'pdf.rms' will change VERY slowly.
         % We demand it effectively stops changing.
-        drift_ok = abs(pdf.rms - prev_pdf_rms) < 0.001 * sigma_pdf; 
+        drift_ok = abs(pdf.rms - prev_pdf_rms) < 3*(sigma_pdf/base_batch_size); 
         % 2. Sanity Check:
         % Just ensure we aren't stuck in a "Zombie" state (RMS > 0.5)
         rms_ok = pdf.rms < 0.2; 
@@ -318,7 +318,7 @@ while true
         % Print outcome for checking
         if mod(qs, 10) == 0
              fprintf('Therm Check (Step %d): RMS=%.4f | Drift=%.1e (Tol %.1e) | Stable? %d\n', ...
-                qs, pdf.rms, abs(pdf.rms - prev_pdf_rms), 0.1*sigma_pdf, drift_ok);
+                qs, pdf.rms, abs(pdf.rms - prev_pdf_rms), 3*(sigma_pdf/base_batch_size), drift_ok);
         end
 		% Checking criteria and accumulate or reset passes
         if drift_ok && rms_ok
