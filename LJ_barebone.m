@@ -247,9 +247,9 @@ for ic=[1,7,8,9]
                     % We define 'opts' here to stress-test the engine
                     
                     opts = struct();
-                    opts.base_gain = 0.5;
-                    opts.sgd_smooth_win = 5;
-                    opts.sgd_cap = 0.003 * S.rp; 
+                    opts.base_gain = 0.1;
+                    opts.sgd_smooth_win = 11;
+                    opts.sgd_cap = 0.05 * S.stdx; 
                     opts.clip_frac = 0.3; 
                     opts.abs_cap_frac = 0.005; 
                     opts.consecutive_passes = 3; 
@@ -283,13 +283,11 @@ for ic=[1,7,8,9]
                         % E. Generate Unique Series Name to prevent overwrites
                         % Include random ID so every run is unique for the database
                         run_id = randi(100000);
-                        opts.series_name = sprintf('ML_Train_Cond%d_Rep%d', ic, run_id);                        
+                        opts.series_name = sprintf('scf1_Cond%d_Rep%d', ic, run_id);                        
                     end
-                    opts.series_name = sprintf('ML_Train_Cond%d_Rep1', ic, irep); 
-                    try
-                        
-                        [p,pgp,ASYMCORR] = sgd_pdf_metric(S,PDF,H,H_interpolant,opts,data_folder);
-                        %[p,pgp,sgd_correction,sgd_edges,history] = sgd_ndens_metric_v2(S,opts,data_folder);
+                    opts.series_name = sprintf('scf1_Cond%d_Rep1', ic, irep); 
+                    try                        
+                        [p,pgp,ASYMCORR] = scf_v1(S,H,H_interpolant,opts,data_folder);
                     catch ME
                          % --- FAILURE HANDLING ---
                          fprintf('!!! CRASH in Rep %d !!!\n', irep);
