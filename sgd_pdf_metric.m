@@ -127,6 +127,8 @@ pgp = p - (2*S.br).*(p ./ (vecnorm(p,2,2) + eps)); % Update ghosts
 
 if S.pot_corr
 
+    
+
 	% --- RADIAL RANGE OF CORRECTION -------------------------------------------------------------------------------------------------
 	sgd_edges = sort((S.br:-0.05*S.rp:S.br - potdepth)'); % in two hundreths of a radius
 	sgd_bins = numel(sgd_edges) - 1;

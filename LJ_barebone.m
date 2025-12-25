@@ -101,7 +101,7 @@ CONDS=effective_diffusivity(data_folder,CONDS,P,C);
 %% SIMULATION EXECUTION
 
 for ic=[1,7,8,9]
-    ic=2;
+    ic=7;
 
     if CONDS.alpha(ic,1)==0
         continue
@@ -287,7 +287,7 @@ for ic=[1,7,8,9]
                     end
                     opts.series_name = sprintf('scf1_Cond%d_Rep1', ic, irep); 
                     try                        
-                        [p,pgp,ASYMCORR] = scf_v1(S,H,H_interpolant,opts,data_folder);
+                        [p,pgp,ASYMCORR] = scf_v3(S,H,H_interpolant,opts,data_folder);
                     catch ME
                          % --- FAILURE HANDLING ---
                          fprintf('!!! CRASH in Rep %d !!!\n', irep);

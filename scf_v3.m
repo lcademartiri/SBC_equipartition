@@ -1,47 +1,8 @@
-function [p,pgp,ASYMCORR] = scf_v1(S,H,H_interpolant,opts,data_folder)
-% SGD_PDF_METRIC (The "Sawtooth" Annealer)
-%
-% Logic:
-% 1. Search Phase: Starts at base_batch_size (physically derived).
-% 2. Convergence: Requires RMS < 1.2 * NoiseFloor for 3 consecutive batches.
-% 3. Annealing: On success, Batch x 4, Gain x 0.5.
-% 4. Production: Once Batch >= 1e5, freezes Gain to 0 and runs 1e6 steps.
-%
-% Key Features: Quadratic Governor, Robust SNR, Free Tangential Ghosts.
+function [p,pgp,ASYMCORR] = scf_v3(S,H,H_interpolant,opts,data_folder)
 
-if nargin < 3, opts = struct(); end
-
-% #################################################################################
-% -------------------- 1. PARSING OPTIONS ================-------------------------
-% #################################################################################
-
-% Dynamics & Control
-if isfield(opts,'base_gain'),            sgd_base_gain_default = opts.base_gain; else sgd_base_gain_default = 0.5; end
-if isfield(opts,'sgd_smooth_win'),       sgd_smooth_win = opts.sgd_smooth_win; else sgd_smooth_win = 5; end
-if isfield(opts,'sgd_cap'),              sgd_cap = opts.sgd_cap; else sgd_cap = 0.003 * S.rp; end  % should be set based on stdx . right now it is redundant
-if isfield(opts,'clip_frac'),            clip_frac = opts.clip_frac; else clip_frac = 0.3; end 
-if isfield(opts,'abs_cap_frac'),         abs_cap_frac = opts.abs_cap_frac; else abs_cap_frac = 0.005; end
-if isfield(opts,'flatness_lambda'),      flatness_lambda = opts.flatness_lambda; else flatness_lambda = 2; end % conservative default
-
-% Annealing / Convergence criteria
-if isfield(opts,'rms_tolerance'),        rms_tolerance = opts.rms_tolerance; else rms_tolerance = 1.2; end 
-if isfield(opts,'consecutive_passes'),   required_passes = opts.consecutive_passes; else required_passes = 3; end 
-if isfield(opts,'stage1_grace_batches'), stage1_grace_batches = opts.stage1_grace_batches; else stage1_grace_batches = 25; end
-if isfield(opts,'stage_grace_batches'),  stage_grace_batches = opts.stage_grace_batches; else stage_grace_batches = 3; end
-if isfield(opts,'max_batch_size'),       max_batch_size_limit = opts.max_batch_size; else max_batch_size_limit = 100000; end
-if isfield(opts,'max_stage_batches'),    max_stage_batches = opts.max_stage_batches; else max_stage_batches = 15; end
-
-% SNR & Gating
-if isfield(opts,'snr_target'),           snr_target = opts.snr_target; else snr_target = 5.0; end
-if isfield(opts,'n_min'),                n_min = opts.n_min; else n_min = 20; end
-if isfield(opts,'use_soft_snr'),         use_soft_snr = opts.use_soft_snr; else use_soft_snr = true; end
-
-% System / IO
-if isfield(opts,'debugging'),            debugging = opts.debugging; else debugging = false; end
-if isfield(opts,'graphing'),             graphing = opts.graphing; else graphing = true; end
-if isfield(opts,'enable_io'),            enable_io = opts.enable_io; else enable_io = true; end
-if isfield(opts,'metric_smoothing_param'), metric_smoothing_param = opts.metric_smoothing_param; else metric_smoothing_param = 0.8; end
-
+enable_io=true;
+debugging=false;
+graphing=true;
 % -------------------- 2. Derived Physical Params -----------------------
 gCS = (1 - S.phi/2) / (1 - S.phi)^3; % Carnahan-Starling Contact Value g(sigma) - probability of finding two particles touching each other compared to an ideal gas
 diffE = S.esdiff * S.alpha / gCS; % Enskog Effective Diffusivity - how fast a particle diffuses inside a dense crowd - corrected by alpha
@@ -51,8 +12,6 @@ steps_for_decorrelation = ceil(5 * relaxsteps); % times for configurational memo
 
 % Noise prefactor for phi=0.4 (Crowded system correction)
 noise_prefactor = 0;
-abs_cap = S.stdx;
-min_clip_floor = 5e-2 * sgd_cap; % minimum change calculated so that 0 correction bins can start changing
 % Depth of the correction 
 taper_width = 1.0 * S.rp; % width of the taper in radius units
 potdepth = S.rc+taper_width;
@@ -70,7 +29,7 @@ if S.potential==1, potname='lj'; elseif S.potential==2, potname='wca'; else potn
 if isfield(opts, 'series_name')
     seriesname = opts.series_name; % Uses the Unique ID from barebones (e.g., Rep1, Rep2)
 else
-    seriesname = 'sgd_anneal';
+    seriesname = 'scf_anneal';
 end
 
 % define specific names of the correction and the starting config
@@ -137,10 +96,11 @@ if S.pot_corr
     steps_since_plot=0;
 
 	% --- RADIAL RANGE OF CORRECTION -------------------------------------------------------------------------------------------------
-	sgd_edges = sort((S.br:-0.05*S.rp:S.br - potdepth)'); % in two hundreths of a radius
-	sgd_bins = numel(sgd_edges) - 1;
-	sgd_centers = sgd_edges(1:end-1) + diff(sgd_edges)/2;
-	sgd_vols=(4/3)*pi*(sgd_edges(2:end)).^3 - (4/3)*pi*(sgd_edges(1:end-1)).^3;
+	scf_edges = sort((S.br:-0.05*S.rp:S.br - potdepth)'); % in two hundreths of a radius
+	scf_bins = numel(scf_edges) - 1;
+	scf_centers = scf_edges(1:end-1) + diff(scf_edges)/2;
+	scf_vols=(4/3)*pi*(scf_edges(2:end)).^3 - (4/3)*pi*(scf_edges(1:end-1)).^3;
+	scf_correction = zeros(scf_bins, 1);
 	% --------------------------------------------------------------------------------------------------------------------------------
 	
 	% --- PDF INITIALIZATION pdf ---------------------------------------------------------------------------------------
@@ -162,64 +122,24 @@ if S.pot_corr
     pdf.geom_factor = 1 - (3/4)*pdf.r_norm + (1/16)*pdf.r_norm.^3; % The Finite Volume Correction Polynomial
     pdf.geom_factor = max(0, pdf.geom_factor); % Clamp negative values to 0
     pdf.ndens0 = (S.N / S.bv);
-    % Corrected Denominator (Halved for Unique Pairs)
     pdf.denom = 0.5 * (pdf.ndens0 * pdf.geom_factor * S.N) .* pdf.vols;
+	pdf.pre_counts = zeros(size(pdf.centers,1), 1);
 	% ----------------------------------------------------------------------------------------------------------------
 	
-	% --- STATISTICAL DETERMINATION OF MINIMUM NUMBER OF STEPS IN BATCH sdmns--------
-	% In dilute system the relaxation time could be very small leading to very small batches which could
-	% mean that many sgd bins remain empty causing problems. So we here calculate how many steps we do
-	% need to have a minimum of counts in each bin	
-	sdmns.min_counts_per_bin = 20; 	
-	sdmns.prob_hit = sgd_vols(1) / S.bv; % Probability of landing in smallest bin (assuming uniform density)	
-	sdmns.required_total_samples = sdmns.min_counts_per_bin / sdmns.prob_hit; % Required total samples = min_counts / prob_hit	
-	sdmns.steps_for_stats = ceil(sdmns.required_total_samples / S.N); % Steps needed = Samples / Number of Particles
-	base_batch_size = max(steps_for_decorrelation, sdmns.steps_for_stats);
-	fprintf('Batch Sizing:\n  Physics Decorrelation: %d steps\n Statistical Floor: %d steps\n -> Selected Batch:%d steps\n', ...
-    steps_for_decorrelation, sdmns.steps_for_stats, base_batch_size);
-	% -------------------------------------------------------------------------------------------------------------------
-
 	% --- TAPER ON CORRECTION  -------------------------------------------------------------------------------------------------------
 	% force correction to taper to zero at the inner edgee of the correction radial range to prevent impulsive forces.
-	r_inner_edge = min(sgd_edges); % inner edge of the correction radial range
-	taper_mask = zeros(sgd_bins, 1); % initialize the taper mask
+	r_inner_edge = min(scf_edges); % inner edge of the correction radial range
+	taper_mask = zeros(scf_bins, 1); % initialize the taper mask
 	% loop creating a linear taper starting from r_inner_edge at 0 and capping at 1 at r_inner_edge+taper_width
-	for itaper = 1:sgd_bins
-		taper_mask(itaper) = min(1, max(0, (sgd_centers(itaper) - r_inner_edge) / taper_width));
+	for itaper = 1:scf_bins
+		taper_mask(itaper) = min(1, max(0, (scf_centers(itaper) - r_inner_edge) / taper_width));
 	end
 	% --------------------------------------------------------------------------------------------------------------------------------
 
-	% --- INITIALIZE KEY VECTORS -----------------------------------------------------------------------------------------
-	sgd_correction = zeros(sgd_bins, 1);
-	batch_sum_drift = zeros(sgd_bins,1);
-	batch_sum_drift_sq = zeros(sgd_bins,1);
-	batch_counts = zeros(sgd_bins,1);
-	pdf.pre_counts = zeros(numel(pdf.edges)-1,1);
-	% --------------------------------------------------------------------------------------------------------------------
-
 	% --- INITIALIZE INTERPOLANT OF CORRECTION ---------------------------------------------------------------------------------------
-	F_corr_interp = griddedInterpolant(sgd_centers, sgd_correction, 'linear', 'nearest');
+	F_corr_interp = griddedInterpolant(scf_centers, scf_correction, 'linear', 'nearest');
 	% --------------------------------------------------------------------------------------------------------------------------------
 
-	% --- STARTING VALUES OF ANNEALING VARIABLES  ------------------------------------------------------------------------
-	steps_in_batch = 0; % step counter in each batch
-	current_batch_mult = 1;
-	sgd_batch_size = base_batch_size * current_batch_mult; % size of the batch
-	sgd_base_gain = sgd_base_gain_default;
-	sgd_gain = sgd_base_gain;
-	rms_pass_counter = 0;
-	batches_in_stage = 0; 
-	stage_index = 1;
-	% --------------------------------------------------------------------------------------------------------------------
-	
-	% --- FLAGS ----------------------------------------------------------------------------------------------------------------------
-	is_frozen_production = false;
-	% --------------------------------------------------------------------------------------------------------------------------------
-	
-	% --- UTILITIES -------------------------------------------------------------------------------------------------------
-	reverseStr = '';
-	% ---------------------------------------------------------------------------------------------------------------------
-	
 	% --- THERMALIZATION CONDITIONS --------------------------------------------------------------------------------------------------
 	therm_pdf_passes = 0;
 	required_therm_passes = 100;
@@ -230,15 +150,6 @@ if S.pot_corr
     therm_block_size = max(ceil(relaxsteps), 1000);
 	% --------------------------------------------------------------------------------------------------------------------------------
 
-	% --- INITIALIZE DIAGNOSTIC VALUES ------------------------------------------------------------------------------------
-	pdf.metric = 0;
-	% ---------------------------------------------------------------------------------------------------------------------
-
-	% --- INITIALIZE HISTORY ---------------------------------------------------------------------------------------------------------
-	history = struct('steps',[],'pdf_dev',[],'pdf_smooth',[],'target',[],'max_corr',[],'gain',[],...
-		'batch_size',[],'fraction_updated',[],'median_snr',[]);
-	% --------------------------------------------------------------------------------------------------------------------------------
-	
 	% --- INITIALIZE PLOTTING AND MONITORING ------------------------------------------------------------------------------
 	if graphing 
 		% initialize number density mapping
@@ -262,7 +173,7 @@ end
 % %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
 if S.pot_corr
-    fprintf('Starting SGD_PDF V2 (Annealing). Base Batch: %d. Gain: %.2f. Cap: %.2e\n', sgd_batch_size, sgd_base_gain, sgd_cap);
+    fprintf('Starting SCF V3 (Annealing)');
 else
     fprintf('Thermalizing structure')
 end
@@ -309,7 +220,7 @@ while true
         % 1. Drift Check:
         % Since we are averaging cumulatively, 'pdf.rms' will change VERY slowly.
         % We demand it effectively stops changing.
-        drift_ok = abs(pdf.rms - prev_pdf_rms) < 5*(sigma_pdf/base_batch_size); 
+        drift_ok = abs(pdf.rms - prev_pdf_rms) < 5*(sigma_pdf/therm_block_size); 
         % 2. Sanity Check:
         % Just ensure we aren't stuck in a "Zombie" state (RMS > 0.5)
         rms_ok = pdf.rms < 0.2; 
@@ -317,7 +228,7 @@ while true
         % Print outcome for checking
         if mod(qs, 10) == 0
              fprintf('Therm Check (Step %d): RMS=%.4f | Drift=%.1e (Tol %.1e) | Stable? %d\n', ...
-                qs, pdf.rms, abs(pdf.rms - prev_pdf_rms), 3*(sigma_pdf/base_batch_size), drift_ok);
+                qs, pdf.rms, abs(pdf.rms - prev_pdf_rms), 5*(sigma_pdf/therm_block_size), drift_ok);
         end
 		% Checking criteria and accumulate or reset passes
         if drift_ok && rms_ok
@@ -343,9 +254,6 @@ while true
             ndens.counts(:) = 0;
             pdf.pre_counts(:) = 0;
             pdf_snapshots = 0;
-            
-            % 3. Reset Momentum (if using it)
-            if exist('sgd_momentum','var'), sgd_momentum(:) = 0; end
             
             % 4. Optional: break the current loop iteration 
             % This prevents the 'if thermflag == 1' block from running with qs=0
@@ -387,14 +295,14 @@ while true
     if thermflag == 1
         % 1. CONTINUOUS ACCUMULATION (Every Step)
         dr_step = sum(base_disp .* pvers, 2); 
-        bin_idx = discretize(prho, sgd_edges);
-        valid = bin_idx > 0 & bin_idx <= sgd_bins;
+        bin_idx = discretize(prho, scf_edges);
+        valid = bin_idx > 0 & bin_idx <= scf_bins;
         
         if any(valid)
             idx = bin_idx(valid); val = dr_step(valid);
-            batch_sum_drift = batch_sum_drift + accumarray(idx, val, [sgd_bins, 1]);
-            batch_sum_drift_sq = batch_sum_drift_sq + accumarray(idx, val.^2, [sgd_bins, 1]);
-            batch_counts = batch_counts + accumarray(idx, 1, [sgd_bins, 1]);
+            batch_sum_drift = batch_sum_drift + accumarray(idx, val, [scf_bins, 1]);
+            batch_sum_drift_sq = batch_sum_drift_sq + accumarray(idx, val.^2, [scf_bins, 1]);
+            batch_counts = batch_counts + accumarray(idx, 1, [scf_bins, 1]);
         end
         
         % Accumulate density for diagnostics
@@ -425,11 +333,11 @@ while true
             
             if any(update_mag ~= 0)
                 % Apply correction
-                sgd_correction = sgd_correction - (update_mag .* taper_mask);
+                scf_correction = scf_correction - (update_mag .* taper_mask);
                 
                 % C. SPATIAL SMOOTHING (Essential for stability)
-                sgd_correction = smoothdata(sgd_correction, 'movmean', 15);
-                F_corr_interp.Values = sgd_correction;
+                scf_correction = smoothdata(scf_correction, 'movmean', 15);
+                F_corr_interp.Values = scf_correction;
 
                 % D. COMMENSURATE MEMORY RESET
                 % If we only corrected a tiny bit (2%), we shouldn't delete 50% of history.
@@ -452,10 +360,13 @@ while true
                 rho_prof = 100 * ((ndens.counts / steps_since_plot ./ ndens.vols) ./ ndens.ndens0);
                 plot(ax1, ndens.centers/S.rp, rho_prof, 'w', 'LineWidth', 2);
                 hold(ax1, 'on'); yline(ax1, 100, '--g'); hold(ax1, 'off');
+				xlim([S.br/(3*S.rp) S.br/(S.rp)]) 
+				pdf.curr_g = (pdf.pre_counts / qs) ./ pdf.denom;
+                plot(ax2, pdf.centers, pdf.curr_g, 'c', 'LineWidth', 2);
+				yline(ax2, 1, '--r')
+                plot(ax3, scf_centers/S.rp, scf_correction, 'c', 'LineWidth', 2);
                 
-                plot(ax3, sgd_centers/S.rp, sgd_correction, 'c', 'LineWidth', 2);
-                
-                bar(ax4, sgd_centers/S.rp, abs(mu)./(sem+eps)); 
+                bar(ax4, scf_centers/S.rp, abs(mu)./(sem+eps)); 
                 yline(ax4, sigmadrift, '-r');
                 drawnow;
                 
@@ -521,10 +432,10 @@ while true
     if qs > 5e7, fprintf('Internal safety limit (5e7) reached.\n'); break; end
 end
 
-ASYMCORR.correction = [sgd_centers, sgd_correction];
-ASYMCORR.history = history; ASYMCORR.sgd_edges = sgd_edges; ASYMCORR.S=S; ASYMCORR.opts=opts;
+ASYMCORR.correction = [scf_centers, scf_correction];
+ASYMCORR.history = history; ASYMCORR.S=S;
 if enable_io
-    save([data_folder,'\',filenamecorrection], 'ASYMCORR', 'sgd_edges');
+    save([data_folder,'\',filenamecorrection], 'ASYMCORR', 'scf_edges');
     save([data_folder,'\',filestartingconfiguration], 'p', 'pgp', 'S');
 end
 disp('SGD V10 Complete.');
