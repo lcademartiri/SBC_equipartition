@@ -101,7 +101,7 @@ CONDS=effective_diffusivity(data_folder,CONDS,P,C);
 %% SIMULATION EXECUTION
 
 for ic=[1,7,8,9]
-    ic=7;
+    ic=2;
 
     if CONDS.alpha(ic,1)==0
         continue
@@ -241,54 +241,9 @@ for ic=[1,7,8,9]
                 if S.pot_corr==0
                     [p,pgp]=sgd_pdf_metric(S,PDF,H,H_interpolant,[],data_folder);
                 else
-                    % ---------------------------------------------------------
-                    % 2. HYPERPARAMETER SAMPLING FOR ML GENERATION
-                    % ---------------------------------------------------------
-                    % We define 'opts' here to stress-test the engine
-                    
-                    opts = struct();
-                    opts.base_gain = 0.1;
-                    opts.sgd_smooth_win = 11;
-                    opts.sgd_cap = 0.05 * S.stdx; 
-                    opts.clip_frac = 0.3; 
-                    opts.abs_cap_frac = 0.005; 
-                    opts.consecutive_passes = 3; 
-                    opts.stage1_grace_batches = 25;
-                    opts.stage_grace_batches = 3;
-                    opts.max_batch_size = 100000;
-                    opts.max_stage_batches = 15;
-                    opts.snr_target = 5.0;
-                    opts.n_min = 20;
-                    opts.use_soft_snr = true;
-                    opts.debugging = false;
-                    opts.graphing = true;
-                    opts.enable_io = true;
-                    opts.metric_smoothing_param = 0.8;
-                    if irep>1
-                        % A. Randomize Gain (e.g., 0.1 to 1.0)
-                        opts.base_gain = 10^(-1.3 + (1.3 * rand()));
-                        % B. Temporal Smoothing (Metric Stability) - NEW!
-                        % Randomly picks between 0.6 (fast reaction) and 0.95 (very stable/high lag)
-                        opts.metric_smoothing_param = 0.6 + (0.35 * rand());
-                        % C. Randomize Smoothing Window (sensitivity)
-                        opts.sgd_smooth_win = randi([3, 9]);                       
-                        % D. CAP RANDOMIZATION (Weighted distribution) ---
-                        % Base: 0.3% | Max: 5.0% | Distribution: Cubic (Skewed to low values)
-                        % 50% of runs < 0.9% Cap. Only 1% of runs > 4.8% Cap.
-                        base_cap = 0.003;
-                        max_cap  = 0.050;
-                        opts.sgd_cap = S.rp * (base_cap + (max_cap - base_cap) * (rand()^3));
-                        % E. Randomize SNR Target between 1.5 (Aggressive/Noisy) and 6.0 (Conservative)
-                        opts.snr_target = 1.5 + (4.5 * rand());
-                        % E. Generate Unique Series Name to prevent overwrites
-                        % Include random ID so every run is unique for the database
-                        run_id = randi(100000);
-                        opts.series_name = sprintf('scf1_Cond%d_Rep%d', ic, run_id);                        
-                    end
-                    opts.series_name = sprintf('scf1_Cond%d_Rep1', ic, irep); 
-                    try                        
-                        [p,pgp,ASYMCORR] = scf_v3(S,H,H_interpolant,opts,data_folder);
-                    catch ME
+                    opts.series_name = sprintf('scf1_Cond%d_Rep1', ic, irep);                         
+                         [p,pgp,ASYMCORR] = scf_v3(S,H,H_interpolant,opts,data_folder);
+
                          % --- FAILURE HANDLING ---
                          fprintf('!!! CRASH in Rep %d !!!\n', irep);
                          fprintf('    Error: %s\n', ME.message);
@@ -301,7 +256,7 @@ for ic=[1,7,8,9]
                          % save(crash_file, 'crash_data');
                          
                          continue; % IMMEDIATELY jump to the next
-                    end
+
                 end
             end
             if P.onlycorr

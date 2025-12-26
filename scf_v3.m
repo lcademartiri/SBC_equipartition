@@ -3,21 +3,26 @@ function [p,pgp,ASYMCORR] = scf_v3(S,H,H_interpolant,opts,data_folder)
 enable_io=true;
 debugging=false;
 graphing=true;
+corr_smooth_window=15;
+pdfdens_int=10;
+gainscale=[0,2,4,10];
+gain_Interpolant=griddedInterpolant([0,1,2,3], gainscale, 'pchip', 'nearest');
+check_interval = 1000;
+check_interval_growth_factor=1.1;
+check_interval_maxsteps=2e5;
+totalbatches=floor(log(check_interval_maxsteps/check_interval)/log(check_interval_growth_factor));
+totalsteps=sum(check_interval.*check_interval_growth_factor.^(1:totalbatches)')
+
 % -------------------- 2. Derived Physical Params -----------------------
 gCS = (1 - S.phi/2) / (1 - S.phi)^3; % Carnahan-Starling Contact Value g(sigma) - probability of finding two particles touching each other compared to an ideal gas
 diffE = S.esdiff * S.alpha / gCS; % Enskog Effective Diffusivity - how fast a particle diffuses inside a dense crowd - corrected by alpha
 tau_alpha = (S.rp^2) / (6 * diffE); % Structural relaxation time - characteristic time it takes for a particle to diffuse a distance equal to its own radius
 relaxsteps = ceil(tau_alpha / S.timestep); % Structural relaxation STEPS
-steps_for_decorrelation = ceil(5 * relaxsteps); % times for configurational memory to decay to <1% (exp(-5) = 0.006)
 
-% Noise prefactor for phi=0.4 (Crowded system correction)
-noise_prefactor = 0;
 % Depth of the correction 
 taper_width = 1.0 * S.rp; % width of the taper in radius units
 potdepth = S.rc+taper_width;
 if 2*S.br - 2*potdepth < 0, potdepth = S.br; end % if correction depth is larger than the domain radius, just use the domain radius 
-
-min_stage_rms = inf; % Track best performance in current stage
 
 % #################################################################################
 % -------------------- 2. FILENAMES -------------------------
@@ -37,15 +42,6 @@ filenamecorrection = sprintf(['ASYMCORR_',seriesname,'_%s_%.0e_%.0e_%.0f_%.1f_%.
     potname,S.rp,S.phi,S.N,S.pot_epsilon/S.kbT,S.pot_sigma);
 filestartingconfiguration = sprintf(['START_SBC_',seriesname,'_%s_%.0e_%.0e_%.0f_%.1f_%.1e.mat'],...
     potname,S.rp,S.phi,S.N,S.pot_epsilon/S.kbT,S.pot_sigma);
-	
-% load pdf denominator if available in database
-if S.bc==1
-    filepdfdenom = sprintf('PDFdenom_SBC_%.0e_%.0e_%.0f.mat',S.rp,S.phi,S.N);
-elseif S.bc==2
-    filepdfdenom = sprintf('PDFdenom_PBCc_%.0e_%.0e_%.0f.mat',S.rp,S.phi,S.N);
-elseif S.bc==3
-    filepdfdenom = sprintf('PDFdenom_PBCFCC_%.0e_%.0e_%.0f.mat',S.rp,S.phi,S.N);
-end
 
 % if all files are already available, just load them and exit
 if enable_io && exist(filenamecorrection,'file') && exist(filestartingconfiguration,'file')
@@ -82,53 +78,46 @@ pgp = p - (2*S.br).*(p ./ (vecnorm(p,2,2) + eps)); % Update ghosts
 
 
 % #################################################################################
-% -------------------- 6. SGD STATE INITALIZATION ---------------------------------
+% -------------------- 6. SCF STATE INITALIZATION ---------------------------------
 % #################################################################################
 
 if S.pot_corr
 
     % --- Leaky Accumulator Params ---
-    memory_factor = 0.5;     % Keep 50% of memory after a correction
-    check_interval = 10000;   % How often to check for the 3-Sigma trigger
-    min_counts_trigger = 500; % Don't act until we have at least 500 effective samples
+       % How often to check for the 3-Sigma trigger
+	dr_step=zeros(S.N,check_interval);
+	base_step=zeros(S.N,check_interval);
+	bin_idx=zeros(S.N,check_interval);
     sigmadrift=3;
     gaindrift=0.1;
     steps_since_plot=0;
 
 	% --- RADIAL RANGE OF CORRECTION -------------------------------------------------------------------------------------------------
-	scf_edges = sort((S.br:-0.05*S.rp:S.br - potdepth)'); % in two hundreths of a radius
+	scf_edges = sort([0;(S.br:-0.05*S.rp:0)']); % in two hundreths of a radius
 	scf_bins = numel(scf_edges) - 1;
 	scf_centers = scf_edges(1:end-1) + diff(scf_edges)/2;
 	scf_vols=(4/3)*pi*(scf_edges(2:end)).^3 - (4/3)*pi*(scf_edges(1:end-1)).^3;
 	scf_correction = zeros(scf_bins, 1);
+	scf_mask=scf_centers>(S.br-potdepth);
 	% --------------------------------------------------------------------------------------------------------------------------------
 	
 	% --- PDF INITIALIZATION pdf ---------------------------------------------------------------------------------------
-	maxdist=2*S.br;
-    if 10*S.rp>(maxdist-2*S.rc)
-        pdf.edges=sort((maxdist:-0.05*S.rp:0)'); % from 0 to box diameter
-    else
-        OS=sort((maxdist:-0.05*S.rp:(maxdist-2*S.rc))');
-        IS=(0:0.05*S.rp:10*S.rp)';
-        MS=linspace(max(IS),min(OS),ceil((min(OS)-max(IS))/S.rp))';
-        pdf.edges=unique(sort([OS;MS;IS]));
-    end
-	clear OS IS MS
+	pdf.edges = sort([0;(2*S.br:-0.05*S.rp:0)']); % in 5 hundreths of a radius
 	pdf.bins = numel(pdf.edges) - 1;
 	pdf.centers = pdf.edges(1:end-1) + diff(pdf.edges)/2;
 	pdf.vols=(4/3)*pi*(pdf.edges(2:end)).^3 - (4/3)*pi*(pdf.edges(1:end-1)).^3;
-	pdf.ndens0 = (S.N / S.bv);
-    pdf.r_norm = pdf.centers / S.br; % Geometric Form Factor - Normalize distance by Box Radius (S.br)
+	pdf.r_norm = pdf.centers / S.br; % Geometric Form Factor - Normalize distance by Box Radius (S.br)
     pdf.geom_factor = 1 - (3/4)*pdf.r_norm + (1/16)*pdf.r_norm.^3; % The Finite Volume Correction Polynomial
     pdf.geom_factor = max(0, pdf.geom_factor); % Clamp negative values to 0
-    pdf.ndens0 = (S.N / S.bv);
-    pdf.denom = 0.5 * (pdf.ndens0 * pdf.geom_factor * S.N) .* pdf.vols;
-	pdf.pre_counts = zeros(size(pdf.centers,1), 1);
+    ndens.ndens0 = (S.N / S.bv);
+    pdf.denom = 0.5 * (ndens.ndens0 * pdf.geom_factor * S.N) .* pdf.vols;
+	pdf.counts = zeros(size(pdf.centers,1), 1);
+	ndens.counts = zeros(size(scf_centers,1), 1);
 	% ----------------------------------------------------------------------------------------------------------------
 	
 	% --- TAPER ON CORRECTION  -------------------------------------------------------------------------------------------------------
 	% force correction to taper to zero at the inner edgee of the correction radial range to prevent impulsive forces.
-	r_inner_edge = min(scf_edges); % inner edge of the correction radial range
+	r_inner_edge = (S.br-potdepth); % inner edge of the correction radial range
 	taper_mask = zeros(scf_bins, 1); % initialize the taper mask
 	% loop creating a linear taper starting from r_inner_edge at 0 and capping at 1 at r_inner_edge+taper_width
 	for itaper = 1:scf_bins
@@ -141,24 +130,12 @@ if S.pot_corr
 	% --------------------------------------------------------------------------------------------------------------------------------
 
 	% --- THERMALIZATION CONDITIONS --------------------------------------------------------------------------------------------------
-	therm_pdf_passes = 0;
-	required_therm_passes = 100;
-	prev_pdf_rms = inf;
 	thermflag = 0;
-	pdf.therm_mask = pdf.centers > 2*(S.br - potdepth) & pdf.centers < 2*S.br-2*S.rp;
-	pdf.mask = pdf.centers > 2*(S.br - potdepth) & pdf.centers < 2*S.br;
-    therm_block_size = max(ceil(relaxsteps), 1000);
+	therm_block_size = max(ceil(relaxsteps), 1000);
 	% --------------------------------------------------------------------------------------------------------------------------------
 
 	% --- INITIALIZE PLOTTING AND MONITORING ------------------------------------------------------------------------------
-	if graphing 
-		% initialize number density mapping
-		ndens.edges = sort((S.br:-0.05*S.rp:0)');
-		ndens.centers = ndens.edges(1:end-1) + diff(ndens.edges)/2;
-		ndens.counts = zeros(numel(ndens.centers),1);
-		ndens.vols = (4/3)*pi*(ndens.edges(2:end).^3 - ndens.edges(1:end-1).^3);
-		ndens.ndens0 = (S.N / S.bv);
-		
+	if graphing 		
 		% Plot Setup
         f_diag = figure('Color', 'k', 'Name', 'Kinetic SCF Diagnostics');
         ax1 = subplot(2,2,1); ax2 = subplot(2,2,2); 
@@ -166,7 +143,6 @@ if S.pot_corr
 	end
 	% -----------------------------------------------------------------------------------------------------------------------
 end
-
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 % -------------------- 7. MAIN LOOP -----------------------------------------------
@@ -184,8 +160,8 @@ qd=1;
 % -----------------------------------------------
 
 qs = 0; % step counter
-
-while true
+exitflag=false;
+while exitflag==false
 	qs = qs + 1; % update counter
 	
 	% --- DEFINE STARTING CONFIGURATION ----------------------------
@@ -195,70 +171,18 @@ while true
     pvers = p ./ (prho + eps);
 	% mask of ghost generators
     idxgp = prho > (S.br - S.rc);
-	% accumulate PDF statistics
-		pairdists = pdist(p); % get distances
-		[hc_pdf, ~] = histcounts(pairdists, pdf.edges); % bin them
-		if numel(hc_pdf) == numel(pdf.pre_counts) % store them
-			pdf.pre_counts = pdf.pre_counts + hc_pdf';
-		end
+	
 	% --------------------------------------------------------------
     
     % --- PDF-BASED THERMALIZATION CHECK -------------------------------------------------------
     if thermflag == 0 && qs > therm_block_size
-        
-        % cumulative normalization (using total steps 'qs')
-        pdf.curr_g = (pdf.pre_counts / qs) ./ pdf.denom;
-        % calculate RMS on the masked PDF
-        pdf.therm_residuals = pdf.curr_g(pdf.therm_mask) - 1;
-        pdf.rms = sqrt(mean(pdf.therm_residuals.^2));
-        % calculate noise floor
-        expected_counts = pdf.denom(pdf.therm_mask) * qs;
-        expected_counts(expected_counts == 0) = inf;
-        sigma_pdf = sqrt(mean(1 ./ expected_counts));
-        
-		% --- THE CRITERIA ---
-        % 1. Drift Check:
-        % Since we are averaging cumulatively, 'pdf.rms' will change VERY slowly.
-        % We demand it effectively stops changing.
-        drift_ok = abs(pdf.rms - prev_pdf_rms) < 5*(sigma_pdf/therm_block_size); 
-        % 2. Sanity Check:
-        % Just ensure we aren't stuck in a "Zombie" state (RMS > 0.5)
-        rms_ok = pdf.rms < 0.2; 
-        
-        % Print outcome for checking
-        if mod(qs, 10) == 0
-             fprintf('Therm Check (Step %d): RMS=%.4f | Drift=%.1e (Tol %.1e) | Stable? %d\n', ...
-                qs, pdf.rms, abs(pdf.rms - prev_pdf_rms), 5*(sigma_pdf/therm_block_size), drift_ok);
-        end
-		% Checking criteria and accumulate or reset passes
-        if drift_ok && rms_ok
-            therm_pdf_passes = therm_pdf_passes + 1;
-        else
-            therm_pdf_passes = 0;
-        end
-        % Store last step's pdf rms for comparison 
-        prev_pdf_rms = pdf.rms;
-		% Completing thermalization     
-        if therm_pdf_passes >= required_therm_passes
-            disp('--- Thermalization Complete (Structural Convergence) ---');
-            
-            % 1. Switch flags
-            thermflag = 1; 
-            qs = 0; % We reset this to start the SGD counter
-            
-            % 2. CRITICAL: Reset ALL Kinetic SCF Accumulators
-            % If you don't do this, the first batch will contain 'junk' from thermalization
-            batch_sum_drift(:) = 0;
-            batch_sum_drift_sq(:) = 0;
-            batch_counts(:) = 0;
-            ndens.counts(:) = 0;
-            pdf.pre_counts(:) = 0;
-            pdf_snapshots = 0;
-            
-            % 4. Optional: break the current loop iteration 
-            % This prevents the 'if thermflag == 1' block from running with qs=0
-            continue; 
-        end
+        thermflag=1;
+		disp('--- Thermalization Complete (Structural Convergence) ---');
+		qs = 1; % We reset this to start the SGD counter
+		if S.pot_corr==0
+			ASYMCORR=0;
+			return
+		end
     end
 	% ----------------------------------------------------------------------------------------------
 
@@ -290,89 +214,117 @@ while true
 	% ------------------------------------------------------------------------------
 
 	% ############################################################################
-    % --- KINETIC SCF ENGINE (REPLACES ML ENGINE) --------------------------------
+    % --- KINETIC SCF ENGINE -----------------------------------------------------
     % ############################################################################
     if thermflag == 1
-        % 1. CONTINUOUS ACCUMULATION (Every Step)
-        dr_step = sum(base_disp .* pvers, 2); 
-        bin_idx = discretize(prho, scf_edges);
-        valid = bin_idx > 0 & bin_idx <= scf_bins;
+        % 1. CONTINUOUS ACCUMULATION OF DISPLACEMENT INFORMATION
+		dr_corr_mag = F_corr_interp(prho);
+		base_step(:,mod(qs-1,check_interval)+1) = vecnorm(base_disp,2,2)+dr_corr_mag; %  displacement norm
+        dr_step(:,mod(qs-1,check_interval)+1) = sum(base_disp .* pvers, 2)+dr_corr_mag; % radial displacement
+        bin_idx(:,mod(qs-1,check_interval)+1) = discretize(prho, scf_edges); % bins of radial displacements
         
-        if any(valid)
-            idx = bin_idx(valid); val = dr_step(valid);
-            batch_sum_drift = batch_sum_drift + accumarray(idx, val, [scf_bins, 1]);
-            batch_sum_drift_sq = batch_sum_drift_sq + accumarray(idx, val.^2, [scf_bins, 1]);
-            batch_counts = batch_counts + accumarray(idx, 1, [scf_bins, 1]);
-        end
-        
-        % Accumulate density for diagnostics
-        [hc_dens, ~] = histcounts(prho, ndens.edges);
-        ndens.counts = ndens.counts + hc_dens';
-        steps_since_plot = steps_since_plot + 1;
+        % 2. CONTINUOUS ACCUMULATION OF NUMBER DENSITY and DISTANCES FOR PDF
+		if mod(qs,pdfdens_int)==0
+			% number density accumulation
+			[hc_dens, ~] = histcounts(prho, scf_edges);
+			ndens.counts = ndens.counts + hc_dens';
+			% number density accumulation
+			pairdists = pdist(p); % get distances
+			[hc_pdf, ~] = histcounts(pairdists, pdf.edges); % bin them
+			if numel(hc_pdf) == numel(pdf.counts) % store them
+				pdf.counts = pdf.counts + hc_pdf';
+			end
+		end
 
         % 3. EVALUATE & CORRECT (Every batch_size)
         if mod(qs, check_interval) == 0
-            % A. Calculate Statistics
-            mu = batch_sum_drift ./ (batch_counts + eps);
-            var_bin = (batch_sum_drift_sq - batch_counts .* mu.^2) ./ max(1, batch_counts - 1);
-            sem = sqrt(max(0, var_bin)) ./ sqrt(batch_counts + eps);
-            
-            % B. THE SOFT-GAIN LOGIC
-            % 1. Calculate Signal-to-Noise Ratio (SNR)
-            drift_snr = abs(mu) ./ (sem + eps);
-            
+			comp = accumarray(bin_idx(:), dr_step(:), [numel(scf_centers) 1], @(x) {x});
+			comp_base = accumarray(bin_idx(:), base_step(:), [numel(scf_centers) 1], @(x) {x});
+            nocomp=size(comp,1);
+            for i0=1:nocomp
+                counts(i0,1)=numel(comp{i0,1});
+                mu(i0,1)=mean(comp{i0,1});
+				radle(i0,1)=mean(comp{i0,1}.*comp_base{i0,1});
+                if counts(i0,1)>100
+                    dr_edges=linspace(-max(abs(comp{i0,1})),max(abs(comp{i0,1})),100)';
+                    dr_centers=dr_edges(1:end-1,1)+0.5*diff(dr_edges(:,1));
+                    try
+                        [hctemp,~]=histcounts(comp{i0,1},dr_edges);
+                        [drifttemp,~,~, ~]=createPVFit(dr_centers, hctemp',0.999);
+                        snr(i0,1)=0.5*(drifttemp(4,3)-drifttemp(4,2));
+                        drift(i0,1)=drifttemp(4,1); 
+						var_r(i0,1) = var(comp{i0,1});
+                    catch
+                        snr(i0,1)=0;
+                        drift(i0,1)=0;
+                    end
+                else
+                    snr(i0,1)=0;
+                    drift(i0,1)=0;
+                end
+            end
+			
+            snr=drift./snr;
+            snr(isnan(snr),:)=0;
+
             % 2. Calculate Commensurate Gain Multiplier
-            % Goal: 0% at SNR=1, ~2% at SNR=2, ~4% at SNR=3, ~10% at SNR=6
-            % A simple linear ramp: Gain = 0.02 * (SNR - 1)
-            % Capped between 0 and a maximum safety limit (e.g., 0.15)
-            gain_multiplier = max(0, 0.02 * (drift_snr - 1.0)); 
-            gain_multiplier = min(0.10, gain_multiplier); % Absolute speed limit
-            
+            gain_multiplier = gain_Interpolant(abs(snr));
+
             % 3. Calculate the Adjustment
-            update_mag = gain_multiplier .* mu; 
+			flux = drift + (radle ./ scf_centers);
+			update_mag = (1e-2*gain_multiplier) .* flux;
+
+            %update_mag = (1e-2*gain_multiplier) .* drift; 
             
             if any(update_mag ~= 0)
+				masktocorr=update_mag>0;
                 % Apply correction
-                scf_correction = scf_correction - (update_mag .* taper_mask);
-                
-                % C. SPATIAL SMOOTHING (Essential for stability)
-                scf_correction = smoothdata(scf_correction, 'movmean', 15);
+				batchcorr=-(update_mag .* taper_mask);
+				batchcorr=smoothdata(batchcorr, 'sgolay', corr_smooth_window);
+                scf_correction = scf_correction + batchcorr;
                 F_corr_interp.Values = scf_correction;
-
-                % D. COMMENSURATE MEMORY RESET
-                % If we only corrected a tiny bit (2%), we shouldn't delete 50% of history.
-                % We scale the "Forgetting" based on how much we trusted the signal.
-                % If gain was 10%, we forget ~50%. If gain was 2%, we forget ~10%.
-                forget_factor = 1.0 - (gain_multiplier * 5.0); % Scale to 0.5-1.0 range
-                forget_factor = max(0.5, min(1.0, forget_factor));
-                
-                batch_sum_drift = batch_sum_drift .* forget_factor;
-                batch_sum_drift_sq = batch_sum_drift_sq .* forget_factor;
-                batch_counts = batch_counts .* forget_factor;
-
+				
                 fprintf('Step %d | Max SNR: %.1f | Max Gain Applied: %.1f%% \n', ...
-                    qs, max(drift_snr), 100 * max(gain_multiplier));
+                    qs, max(snr), max(gain_multiplier));
             end
-        
             
             % C. DIAGNOSTICS (Plot every batch or so)
             if graphing
-                rho_prof = 100 * ((ndens.counts / steps_since_plot ./ ndens.vols) ./ ndens.ndens0);
-                plot(ax1, ndens.centers/S.rp, rho_prof, 'w', 'LineWidth', 2);
-                hold(ax1, 'on'); yline(ax1, 100, '--g'); hold(ax1, 'off');
-				xlim([S.br/(3*S.rp) S.br/(S.rp)]) 
-				pdf.curr_g = (pdf.pre_counts / qs) ./ pdf.denom;
-                plot(ax2, pdf.centers, pdf.curr_g, 'c', 'LineWidth', 2);
-				yline(ax2, 1, '--r')
+				% DENSITY PLOT
+				ndens.meancounts=(ndens.counts./(check_interval/pdfdens_int));
+				ndens.meandens=ndens.meancounts./scf_vols;
+				ndens.reldens=ndens.meandens./ndens.ndens0;
+                plot(ax1, scf_centers/S.rp, ndens.reldens, 'w', 'LineWidth', 2);
+                hold(ax1, 'on'); yline(ax1, 1, '--g'); hold(ax1, 'off');
+				xlim(ax1,[S.br/(3*S.rp) S.br/(S.rp)]) 
+				% PDF PLOT
+				pdf.curr_g = (pdf.counts / (check_interval/pdfdens_int)) ./ pdf.denom;
+                plot(ax2, pdf.centers/S.rp, pdf.curr_g, 'c', 'LineWidth', 2);
+				hold(ax2, 'on'), yline(ax2, 1, '--r'), hold(ax2, 'off')
+				% CORRECTION PLOT
                 plot(ax3, scf_centers/S.rp, scf_correction, 'c', 'LineWidth', 2);
-                
-                bar(ax4, scf_centers/S.rp, abs(mu)./(sem+eps)); 
+				xlim(ax3,[(S.br-potdepth)/(S.rp) S.br/(S.rp)])
+                % SNR PLOT
+                bar(ax4, scf_centers/S.rp, snr);
+				hold(ax4, 'on');				
                 yline(ax4, sigmadrift, '-r');
+				yline(ax4, -sigmadrift, '-r');
+				hold(ax4, 'off');
                 drawnow;
                 
                 % Clear density diagnostic (purely for plotting clarity)
-                ndens.counts(:) = 0; steps_since_plot = 0;
+                ndens.counts(:) = 0;	
+                pdf.counts(:) = 0;
             end
+			check_interval=floor(check_interval_growth_factor*check_interval);
+			if check_interval>check_interval_maxsteps;
+				check_interval=check_interval_maxsteps;
+				exitflag=1;
+			end
+			base_step=zeros(S.N,check_interval);
+			dr_step=zeros(S.N,check_interval);
+			bin_idx=zeros(S.N,check_interval);
+			qs=0;
         end
     end
 
@@ -429,7 +381,7 @@ while true
 	pgp(~idx_swap,:) = pgp2(~idx_swap,:);
 	% -----------------------------------------------------------------
 
-    if qs > 5e7, fprintf('Internal safety limit (5e7) reached.\n'); break; end
+    if qs > 1e6, fprintf('Internal safety limit (1e6) reached.\n'); break; end
 end
 
 ASYMCORR.correction = [scf_centers, scf_correction];
