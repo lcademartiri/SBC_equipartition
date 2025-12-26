@@ -242,7 +242,7 @@ for ic=[1,7,8,9]
                     [p,pgp]=sgd_pdf_metric(S,PDF,H,H_interpolant,[],data_folder);
                 else
                     opts.series_name = sprintf('scf1_Cond%d_Rep1', ic, irep);                         
-                         [p,pgp,ASYMCORR] = scf_v3(S,H,H_interpolant,opts,data_folder);
+                         [p,pgp,ASYMCORR] = scf_v4(S,H,H_interpolant,opts,data_folder);
 
                          % --- FAILURE HANDLING ---
                          fprintf('!!! CRASH in Rep %d !!!\n', irep);
