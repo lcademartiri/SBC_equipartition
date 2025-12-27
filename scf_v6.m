@@ -1,19 +1,43 @@
-function [p,pgp,ASYMCORR] = scf_v3(S,H,H_interpolant,opts,data_folder)
+function [p,pgp,ASYMCORR] = scf_v6(S,H,H_interpolant,opts,data_folder)
 
-% non-MODAL SCF - 2R tether - covariance correction to flux
+%non-modal SCF - covariance correction to flux - isochoric fuzzy tether
 
 enable_io=true;
 debugging=false;
 graphing=true;
 corr_smooth_window=15;
 pdfdens_int=10;
-gainscale=[0,2,4,10];
+gainscale=[0,6,12,30];
 gain_Interpolant=griddedInterpolant([0,1,2,3], gainscale, 'pchip', 'nearest');
 check_interval = 1000;
 check_interval_growth_factor=1.1;
 check_interval_maxsteps=2e5;
 totalbatches=floor(log(check_interval_maxsteps/check_interval)/log(check_interval_growth_factor));
 totalsteps=sum(check_interval.*check_interval_growth_factor.^(1:totalbatches)')
+% Create a "Rough Wall" by assigning a unique boundary radius to each particle
+% We vary the radius by +/- 0.5 particle radii.
+% This is enough to de-phase the hydration shells without destroying the physics.
+% --- VOLUME-NEUTRAL GHOST PROTOCOL ---
+% Define the width of the fuzzy region (e.g., +/- 0.5 sigma)
+fuzz_width = 0.5 * S.rp; 
+R_min = S.br - fuzz_width;
+R_max = S.br + fuzz_width;
+
+% Calculate Volume limits
+V_min = (4/3) * pi * R_min^3;
+V_max = (4/3) * pi * R_max^3;
+
+% Sample VOLUME uniformly, not Radius
+% This creates a distribution of radii that is slightly denser at larger R
+% to perfectly compensate for the R^2 growth of surface area.
+V_samples = V_min + (V_max - V_min) * rand(S.N, 1);
+
+% Convert back to Radius for the tether
+S.Reff = (V_samples ./ ((4/3)*pi)).^(1/3);
+
+% Verification (Optional)
+fprintf('Nominal Vol: %.4e | Avg Fuzzy Vol: %.4e | Ratio: %.6f\n', ...
+    (4/3)*pi*S.br^3, mean(V_samples), mean(V_samples)/((4/3)*pi*S.br^3));
 
 % -------------------- 2. Derived Physical Params -----------------------
 gCS = (1 - S.phi/2) / (1 - S.phi)^3; % Carnahan-Starling Contact Value g(sigma) - probability of finding two particles touching each other compared to an ideal gas
@@ -95,13 +119,23 @@ if S.pot_corr
     steps_since_plot=0;
 
 	% --- RADIAL RANGE OF CORRECTION -------------------------------------------------------------------------------------------------
-	scf_edges = sort([0;(S.br:-0.05*S.rp:0)']); % in two hundreths of a radius
+	scf_edges = sort([0;(S.br+1*S.rp:-0.05*S.rp:0)']); % in two hundreths of a radius
 	scf_bins = numel(scf_edges) - 1;
 	scf_centers = scf_edges(1:end-1) + diff(scf_edges)/2;
 	scf_vols=(4/3)*pi*(scf_edges(2:end)).^3 - (4/3)*pi*(scf_edges(1:end-1)).^3;
 	scf_correction = zeros(scf_bins, 1);
 	scf_mask=scf_centers>(S.br-potdepth);
 	% --------------------------------------------------------------------------------------------------------------------------------
+	
+	% --- NUMBER DENSITY INITIALIZATION -------------------------------------------------
+	ndens.edges = sort([0;(S.br+S.rc:-0.05*S.rp:0)']);
+	ndens.bins = numel(ndens.edges) - 1;
+	ndens.centers = ndens.edges(1:end-1) + diff(ndens.edges)/2;
+	ndens.vols=(4/3)*pi*(ndens.edges(2:end)).^3 - (4/3)*pi*(ndens.edges(1:end-1)).^3;
+	ndens.counts_reals = zeros(ndens.bins, 1);
+	ndens.counts_ghosts = zeros(ndens.bins, 1);
+	ndens.ndens0 = (S.N / S.bv);
+	% -----------------------------------------------------------------------------------
 	
 	% --- PDF INITIALIZATION pdf ---------------------------------------------------------------------------------------
 	pdf.edges = sort([0;(2*S.br:-0.05*S.rp:0)']); % in 5 hundreths of a radius
@@ -110,11 +144,9 @@ if S.pot_corr
 	pdf.vols=(4/3)*pi*(pdf.edges(2:end)).^3 - (4/3)*pi*(pdf.edges(1:end-1)).^3;
 	pdf.r_norm = pdf.centers / S.br; % Geometric Form Factor - Normalize distance by Box Radius (S.br)
     pdf.geom_factor = 1 - (3/4)*pdf.r_norm + (1/16)*pdf.r_norm.^3; % The Finite Volume Correction Polynomial
-    pdf.geom_factor = max(0, pdf.geom_factor); % Clamp negative values to 0
-    ndens.ndens0 = (S.N / S.bv);
+    pdf.geom_factor = max(0, pdf.geom_factor); % Clamp negative values to 0   
     pdf.denom = 0.5 * (ndens.ndens0 * pdf.geom_factor * S.N) .* pdf.vols;
 	pdf.counts = zeros(size(pdf.centers,1), 1);
-	ndens.counts = zeros(size(scf_centers,1), 1);
 	% ----------------------------------------------------------------------------------------------------------------
 	
 	% --- TAPER ON CORRECTION  -------------------------------------------------------------------------------------------------------
@@ -227,9 +259,11 @@ while exitflag==false
         
         % 2. CONTINUOUS ACCUMULATION OF NUMBER DENSITY and DISTANCES FOR PDF
 		if mod(qs,pdfdens_int)==0
-			% number density accumulation
-			[hc_dens, ~] = histcounts(prho, scf_edges);
-			ndens.counts = ndens.counts + hc_dens';
+			% number density accumulation of reals
+			[hc_dens, ~] = histcounts(prho, ndens.edges);
+			ndens.counts_reals = ndens.counts_reals + hc_dens';
+			[hc_dens, ~] = histcounts(vecnorm(pgp,2,2), ndens.edges);
+			ndens.counts_ghosts = ndens.counts_ghosts + hc_dens';
 			% number density accumulation
 			pairdists = pdist(p); % get distances
 			[hc_pdf, ~] = histcounts(pairdists, pdf.edges); % bin them
@@ -293,19 +327,34 @@ while exitflag==false
             % C. DIAGNOSTICS (Plot every batch or so)
             if graphing
 				% DENSITY PLOT
-				ndens.meancounts=(ndens.counts./(check_interval/pdfdens_int));
-				ndens.meandens=ndens.meancounts./scf_vols;
-				ndens.reldens=ndens.meandens./ndens.ndens0;
-                plot(ax1, scf_centers/S.rp, ndens.reldens, 'w', 'LineWidth', 2);
-                hold(ax1, 'on'); yline(ax1, 1, '--g'); hold(ax1, 'off');
-				xlim(ax1,[S.br/(3*S.rp) S.br/(S.rp)]) 
+				ndens.meancounts=(ndens.counts_reals./(check_interval/pdfdens_int));
+				ndens.meandens=ndens.meancounts./ndens.vols;
+				ndens.reldens_reals=ndens.meandens./ndens.ndens0;
+				ndens.meancounts=(ndens.counts_ghosts./(check_interval/pdfdens_int));
+				ndens.meandens=ndens.meancounts./ndens.vols;
+				ndens.reldens_ghosts=ndens.meandens./ndens.ndens0;
+				
+                plot(ax1, ndens.centers/S.rp, ndens.reldens_reals+ndens.reldens_ghosts, 'w', 'LineWidth', 2);
+                hold(ax1, 'on'); 
+				plot(ax1, ndens.centers/S.rp, ndens.reldens_ghosts, 'r', 'LineWidth', 2);
+				plot(ax1, ndens.centers/S.rp, ndens.reldens_reals, 'g', 'LineWidth', 2);
+				yline(ax1, 1, '--g');
+				xline(ax1, (S.br/S.rp), '--g');
+				xlim(ax1,[S.br/(3*S.rp) (S.br+S.rc)/(S.rp)])
+				hold(ax1, 'off');
+				
+				
 				% PDF PLOT
 				pdf.curr_g = (pdf.counts / (check_interval/pdfdens_int)) ./ pdf.denom;
                 plot(ax2, pdf.centers/S.rp, pdf.curr_g, 'c', 'LineWidth', 2);
-				hold(ax2, 'on'), yline(ax2, 1, '--r'), hold(ax2, 'off')
+				hold(ax2, 'on'), 
+				yline(ax2, 1, '--r'), 
+				ylim(ax2,[0 2])
+				hold(ax2, 'off')
 				% CORRECTION PLOT
                 plot(ax3, scf_centers/S.rp, scf_correction, 'c', 'LineWidth', 2);
 				xlim(ax3,[(S.br-potdepth)/(S.rp) S.br/(S.rp)])
+				xline(ax3, (S.br/S.rp), '--g');
                 % SNR PLOT
                 bar(ax4, scf_centers/S.rp, snr);
 				hold(ax4, 'on');				
@@ -315,7 +364,8 @@ while exitflag==false
                 drawnow;
                 
                 % Clear density diagnostic (purely for plotting clarity)
-                ndens.counts(:) = 0;	
+                ndens.counts_reals(:) = 0;	
+				ndens.counts_ghosts(:) = 0;				
                 pdf.counts(:) = 0;
             end
 			check_interval=floor(check_interval_growth_factor*check_interval);
@@ -357,7 +407,7 @@ while exitflag==false
 	% recalculate versors
     pgp_next_dir  = pgp_temp ./ (vecnorm(pgp_temp, 2, 2) + eps);
 	% calculate final position as tethered to updated real positions
-    pgp2  = pgp_next_dir .* (2*S.br - p2rho);
+    pgp2 = pgp_next_dir .* (2*S.Reff - p2rho);
 	% -----------------------------------------------------------------
 
     % Hard Sphere Reset logic
@@ -373,7 +423,7 @@ while exitflag==false
         end
     end
 	
-	% --- PROMOTION AND DEMOTION --------------------------------------
+	% --- PROMOTION AND DEMOTION AND PROPAGATION ----------------------
     p2rho = vecnorm(p2,2,2); 
 	pgp2rho = vecnorm(pgp2,2,2);
     idx_swap = p2rho > pgp2rho;

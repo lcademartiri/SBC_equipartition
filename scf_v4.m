@@ -1,5 +1,7 @@
 function [p,pgp,ASYMCORR] = scf_v4(S,H,H_interpolant,opts,data_folder)
 
+% modal SCF using covariance radial dispplacement/|displacement| - 2R tether
+
 enable_io=true;
 debugging=false;
 graphing=true;

@@ -1,6 +1,6 @@
-function [p,pgp,ASYMCORR] = scf_v3(S,H,H_interpolant,opts,data_folder)
+function [p,pgp,ASYMCORR] = scf_v5(S,H,H_interpolant,opts,data_folder)
 
-% non-MODAL SCF - 2R tether - covariance correction to flux
+% modal SCF version using MSD to account for geometric bias - 2R tether
 
 enable_io=true;
 debugging=false;
@@ -10,7 +10,7 @@ pdfdens_int=10;
 gainscale=[0,2,4,10];
 gain_Interpolant=griddedInterpolant([0,1,2,3], gainscale, 'pchip', 'nearest');
 check_interval = 1000;
-check_interval_growth_factor=1.1;
+check_interval_growth_factor=1.2;
 check_interval_maxsteps=2e5;
 totalbatches=floor(log(check_interval_maxsteps/check_interval)/log(check_interval_growth_factor));
 totalsteps=sum(check_interval.*check_interval_growth_factor.^(1:totalbatches)')
@@ -36,7 +36,7 @@ if S.potential==1, potname='lj'; elseif S.potential==2, potname='wca'; else potn
 if isfield(opts, 'series_name')
     seriesname = opts.series_name; % Uses the Unique ID from barebones (e.g., Rep1, Rep2)
 else
-    seriesname = 'scf_anneal';
+    seriesname = 'scf.anneal';
 end
 
 % define specific names of the correction and the starting config
@@ -95,13 +95,25 @@ if S.pot_corr
     steps_since_plot=0;
 
 	% --- RADIAL RANGE OF CORRECTION -------------------------------------------------------------------------------------------------
-	scf_edges = sort([0;(S.br:-0.05*S.rp:0)']); % in two hundreths of a radius
-	scf_bins = numel(scf_edges) - 1;
-	scf_centers = scf_edges(1:end-1) + diff(scf_edges)/2;
-	scf_vols=(4/3)*pi*(scf_edges(2:end)).^3 - (4/3)*pi*(scf_edges(1:end-1)).^3;
-	scf_correction = zeros(scf_bins, 1);
-	scf_mask=scf_centers>(S.br-potdepth);
+	scf.edges = sort([0;(S.br:-0.05*S.rp:0)']); % in two hundreths of a radius
+	scf.bins = numel(scf.edges) - 1;
+	scf.centers = scf.edges(1:end-1) + diff(scf.edges)/2;
+	scf.vols=(4/3)*pi*(scf.edges(2:end)).^3 - (4/3)*pi*(scf.edges(1:end-1)).^3;
+	scf.correction = zeros(scf.bins, 1);
+	scf.mask=scf.centers>(S.br-potdepth);
+	scf.modes.leftovers=mod(scf.bins,(1:scf.bins)');
+	scf.modes.bins=find(scf.modes.leftovers<(0.1*scf.bins));
+	for im=1:numel(scf.modes.bins)
+		temp=scf.centers(scf.modes.leftovers(scf.modes.bins(im))+1:end,:);
+		templ=scf.centers(1:scf.modes.leftovers(scf.modes.bins(im)));
+		temp=reshape(temp',[],floor(scf.bins/scf.modes.bins(im)))';
+		scf.modes.centers{im,1}=mean(temp,2);
+		scf.modes.centers{im,1}=[mean(templ);scf.modes.centers{im,1}];
+		scf.modes.centers{im,1}=scf.modes.centers{im,1}(~isnan(scf.modes.centers{im,1}),:);
+	end
+	
 	% --------------------------------------------------------------------------------------------------------------------------------
+	
 	
 	% --- PDF INITIALIZATION pdf ---------------------------------------------------------------------------------------
 	pdf.edges = sort([0;(2*S.br:-0.05*S.rp:0)']); % in 5 hundreths of a radius
@@ -114,21 +126,21 @@ if S.pot_corr
     ndens.ndens0 = (S.N / S.bv);
     pdf.denom = 0.5 * (ndens.ndens0 * pdf.geom_factor * S.N) .* pdf.vols;
 	pdf.counts = zeros(size(pdf.centers,1), 1);
-	ndens.counts = zeros(size(scf_centers,1), 1);
+	ndens.counts = zeros(size(scf.centers,1), 1);
 	% ----------------------------------------------------------------------------------------------------------------
 	
 	% --- TAPER ON CORRECTION  -------------------------------------------------------------------------------------------------------
 	% force correction to taper to zero at the inner edgee of the correction radial range to prevent impulsive forces.
 	r_inner_edge = (S.br-potdepth); % inner edge of the correction radial range
-	taper_mask = zeros(scf_bins, 1); % initialize the taper mask
+	taper_mask = zeros(scf.bins, 1); % initialize the taper mask
 	% loop creating a linear taper starting from r_inner_edge at 0 and capping at 1 at r_inner_edge+taper_width
-	for itaper = 1:scf_bins
-		taper_mask(itaper) = min(1, max(0, (scf_centers(itaper) - r_inner_edge) / taper_width));
+	for itaper = 1:scf.bins
+		taper_mask(itaper) = min(1, max(0, (scf.centers(itaper) - r_inner_edge) / taper_width));
 	end
 	% --------------------------------------------------------------------------------------------------------------------------------
 
 	% --- INITIALIZE INTERPOLANT OF CORRECTION ---------------------------------------------------------------------------------------
-	F_corr_interp = griddedInterpolant(scf_centers, scf_correction, 'linear', 'nearest');
+	F_corr_interp = griddedInterpolant(scf.centers, scf.correction, 'linear', 'nearest');
 	% --------------------------------------------------------------------------------------------------------------------------------
 
 	% --- THERMALIZATION CONDITIONS --------------------------------------------------------------------------------------------------
@@ -142,7 +154,18 @@ if S.pot_corr
         f_diag = figure('Color', 'k', 'Name', 'Kinetic SCF Diagnostics');
         ax1 = subplot(2,2,1); ax2 = subplot(2,2,2); 
         ax3 = subplot(2,2,3); ax4 = subplot(2,2,4);
-	end
+		
+		% --- Add to the existing S.pot_corr initialization block ---
+		% History buffer for heatmap (Radius x Batch)
+		% We'll start with a fixed size and grow it if needed
+		correction_history = zeros(scf.bins, 500); 
+		batch_count = 0;
+
+		f_modal = figure('Color', 'k', 'Name', 'Modal Spectrum & Stability');
+		ax_spec = subplot(2,2,1); title(ax_spec, 'Modal Update Spectrum', 'Color', 'w');
+		ax_res  = subplot(2,2,2); title(ax_res, 'Residual Flux vs. Correction', 'Color', 'w');
+		ax_heat = subplot(2,1,2); title(ax_heat, 'Correction Evolution (Heatmap)', 'Color', 'w');
+		end
 	% -----------------------------------------------------------------------------------------------------------------------
 end
 
@@ -151,7 +174,7 @@ end
 % %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
 if S.pot_corr
-    fprintf('Starting SCF V3 (Annealing)');
+    fprintf('Starting SCF Annealing');
 else
     fprintf('Thermalizing structure')
 end
@@ -163,6 +186,9 @@ qd=1;
 
 qs = 0; % step counter
 exitflag=false;
+% Replace the cell initialization with this:
+modal_lines = struct('r', [], 'u', [], 'k', []);
+
 while exitflag==false
 	qs = qs + 1; % update counter
 	
@@ -223,12 +249,12 @@ while exitflag==false
 		dr_corr_mag = F_corr_interp(prho);
 		base_step(:,mod(qs-1,check_interval)+1) = vecnorm(base_disp,2,2)+dr_corr_mag; %  displacement norm
         dr_step(:,mod(qs-1,check_interval)+1) = sum(base_disp .* pvers, 2)+dr_corr_mag; % radial displacement
-        bin_idx(:,mod(qs-1,check_interval)+1) = discretize(prho, scf_edges); % bins of radial displacements
+        bin_idx(:,mod(qs-1,check_interval)+1) = discretize(prho, scf.edges); % bins of radial displacements
         
         % 2. CONTINUOUS ACCUMULATION OF NUMBER DENSITY and DISTANCES FOR PDF
 		if mod(qs,pdfdens_int)==0
 			% number density accumulation
-			[hc_dens, ~] = histcounts(prho, scf_edges);
+			[hc_dens, ~] = histcounts(prho, scf.edges);
 			ndens.counts = ndens.counts + hc_dens';
 			% number density accumulation
 			pairdists = pdist(p); % get distances
@@ -240,63 +266,131 @@ while exitflag==false
 
         % 3. EVALUATE & CORRECT (Every batch_size)
         if mod(qs, check_interval) == 0
-			comp = accumarray(bin_idx(:), dr_step(:), [numel(scf_centers) 1], @(x) {x});
-			comp_base = accumarray(bin_idx(:), base_step(:), [numel(scf_centers) 1], @(x) {x});
-            nocomp=size(comp,1);
-            for i0=1:nocomp
-                counts(i0,1)=numel(comp{i0,1});
-                mu(i0,1)=mean(comp{i0,1});
-				radle(i0,1)=mean(comp{i0,1}.*comp_base{i0,1});
-                if counts(i0,1)>100
-                    dr_edges=linspace(-max(abs(comp{i0,1})),max(abs(comp{i0,1})),100)';
-                    dr_centers=dr_edges(1:end-1,1)+0.5*diff(dr_edges(:,1));
-                    try
-                        [hctemp,~]=histcounts(comp{i0,1},dr_edges);
-                        [drifttemp,~,~, ~]=createPVFit(dr_centers, hctemp',0.999);
-                        snr(i0,1)=0.5*(drifttemp(4,3)-drifttemp(4,2));
-                        drift(i0,1)=drifttemp(4,1); 
-						var_r(i0,1) = var(comp{i0,1});
-                    catch
-                        snr(i0,1)=0;
-                        drift(i0,1)=0;
-                    end
+			comp = accumarray(bin_idx(:), dr_step(:), [numel(scf.centers) 1], @(x) {x});
+			comp_base = accumarray(bin_idx(:), base_step(:), [numel(scf.centers) 1], @(x) {x});
+            update_full = zeros(scf.bins,1);
+			weight_full = zeros(scf.bins,1);
+            qcenters=0;
+			for ib=scf.modes.bins'
+                qcenters=qcenters+1;
+                scftempcenters=scf.modes.centers{qcenters,1};
+				if ib==1
+					compb=comp;
+					compb_base=comp_base;
                 else
-                    snr(i0,1)=0;
-                    drift(i0,1)=0;
-                end
-            end
-			
-            snr=drift./snr;
-            snr(isnan(snr),:)=0;
+                    if scf.modes.leftovers(ib)~=0
+					    compl=comp(1:scf.modes.leftovers(ib),:);
+					    compl_base=comp_base(1:scf.modes.leftovers(ib),:);
+                        compl = cellfun(@(x) vertcat(compl{:, x}), num2cell(1:size(compl,2)), 'UniformOutput', false)';
+					    compl_base = cellfun(@(x) vertcat(compl_base{:, x}), num2cell(1:size(compl_base,2)), 'UniformOutput', false)';
+                    else
+                        compl=[];
+                        compl_base=[];
+                    end
+					compb=comp(scf.modes.leftovers(ib)+1:end,:);
+					compb_base=comp_base(scf.modes.leftovers(ib)+1:end,:);
+					compb=reshape(compb',[],floor(scf.bins/ib));
+					compb_base=reshape(compb_base',[],floor(scf.bins/ib));
+					compb = cellfun(@(x) vertcat(compb{:, x}), num2cell(1:size(compb,2)), 'UniformOutput', false)';
+					compb_base = cellfun(@(x) vertcat(compb_base{:, x}), num2cell(1:size(compb_base,2)), 'UniformOutput', false)';					
+					compb=vertcat(compl,compb);
+					compb_base=vertcat(compl_base,compb_base);
+				end
+				nocomp=size(compb,1);
+				counts=[];
+				mu_raw=[];
+				mean_abs=[];
+				drift=[];
+				snr=[];
+                flux=[];
+				for i0=1:nocomp					
+					counts(i0,1)=numel(compb{i0,1});					
+					if counts(i0,1)>100
+						% 1. Raw Stats
+						mu_raw(i0,1)=mean(compb{i0,1});
+						msd(i0,1) = mean(compb_base{i0,1}.^2);
+						
+						dr_edges=linspace(-max(abs(compb{i0,1})),max(abs(compb{i0,1})),100)';
+						dr_centers=dr_edges(1:end-1,1)+0.5*diff(dr_edges(:,1));
+						
+						try
+							[hctemp,~]=histcounts(compb{i0,1},dr_edges);
+							[drifttemp,~,~, ~]=createPVFit(dr_centers, hctemp',0.999);
+							
+							% 2. Observed Radial Drift
+							drift(i0,1) = drifttemp(4,1);
+							
+							% 3. Noise and SNR
+							snr_err = 0.5*(drifttemp(4,3)-drifttemp(4,2));
+							snr(i0,1) = abs(drift(i0,1)) / (snr_err + eps);
 
-            % 2. Calculate Commensurate Gain Multiplier
-            gain_multiplier = gain_Interpolant(abs(snr));
-
-            % 3. Calculate the Adjustment
-			flux = drift + (radle ./ scf_centers);
-			update_mag = (1e-2*gain_multiplier) .* flux;
-
-            %update_mag = (1e-2*gain_multiplier) .* drift; 
-            
-            if any(update_mag ~= 0)
-				masktocorr=update_mag>0;
-                % Apply correction
-				batchcorr=-(update_mag .* taper_mask);
-				batchcorr=smoothdata(batchcorr, 'sgolay', corr_smooth_window);
-                scf_correction = scf_correction + batchcorr;
-                F_corr_interp.Values = scf_correction;
+							% 4. PRECISE GEOMETRIC FLUX (Fix for incompatible sizes)
+							% Calculate scalar-by-scalar to avoid array mismatch
+							current_geo_flux = msd(i0,1) / (3 * scftempcenters(i0,1));
+							flux(i0,1) = drift(i0,1) - current_geo_flux;
+						catch
+							snr(i0,1)=0;
+							flux(i0,1)=0;
+						end
+					else
+						snr(i0,1)=0;
+						flux(i0,1)=0;
+					end
+				end
 				
-                fprintf('Step %d | Max SNR: %.1f | Max Gain Applied: %.1f%% \n', ...
-                    qs, max(snr), max(gain_multiplier));
-            end
+				% Clean up any NaNs before modal update
+				snr(isnan(snr)) = 0;
+				flux(isnan(flux)) = 0;
+				
+				% 2. Calculate Commensurate Gain Multiplier
+				gain_multiplier = gain_Interpolant(abs(snr));
+				update_mag = (1e-2*gain_multiplier) .* flux;
+                update_mag(isnan(update_mag))=0;
+				
+				% --- MAP MODAL UPDATE BACK TO FULL RESOLUTION --------------------
+
+				% interpolate modal update onto full grid
+				if numel(scftempcenters) > 1 && numel(update_mag) > 1 
+                    u_interp = interp1(scftempcenters, update_mag, scf.centers, 'linear', 'extrap');
+                else
+                    u_interp = update_mag(1) * ones(size(scf.centers));
+                end
+				
+				if graphing
+					% Store the interpolated update for this mode to plot later
+					modal_lines(ib).r = scf.centers;
+					modal_lines(ib).u = u_interp;
+					modal_lines(ib).k = ib;
+					if ib == 1
+						high_res_flux = flux; % This is the raw evidence the SCF is trying to fix
+					end
+				end
+				
+				w_mode = (1/ib) * ones(size(u_interp)); % 'ib' is the aggregation factor
+				update_full = update_full + w_mode .* u_interp;
+				weight_full = weight_full + w_mode;
+			end
+			
+			% --- COMBINE MODES AND APPLY CORRECTION --------------------------
+
+			valid = weight_full > 0;
+			update_combined = zeros(size(update_full));
+			update_combined(valid) = update_full(valid) ./ weight_full(valid);
+
+			batchcorr = -(update_combined .* taper_mask);
+			batchcorr = smoothdata(batchcorr, 'sgolay', corr_smooth_window);
+
+			scf.correction = scf.correction + batchcorr;
+			F_corr_interp.Values = scf.correction;
+
             
             % C. DIAGNOSTICS (Plot every batch or so)
             if graphing
 				% DENSITY PLOT
 				ndens.meancounts=(ndens.counts./(check_interval/pdfdens_int));
-				ndens.meandens=ndens.meancounts./scf_vols;
+				ndens.meandens=ndens.meancounts./scf.vols;
 				ndens.reldens=ndens.meandens./ndens.ndens0;
-                plot(ax1, scf_centers/S.rp, ndens.reldens, 'w', 'LineWidth', 2);
+                plot(ax1, scf.centers/S.rp, ndens.reldens, 'w', 'LineWidth', 2);
                 hold(ax1, 'on'); yline(ax1, 1, '--g'); hold(ax1, 'off');
 				xlim(ax1,[S.br/(3*S.rp) S.br/(S.rp)]) 
 				% PDF PLOT
@@ -304,10 +398,10 @@ while exitflag==false
                 plot(ax2, pdf.centers/S.rp, pdf.curr_g, 'c', 'LineWidth', 2);
 				hold(ax2, 'on'), yline(ax2, 1, '--r'), hold(ax2, 'off')
 				% CORRECTION PLOT
-                plot(ax3, scf_centers/S.rp, scf_correction, 'c', 'LineWidth', 2);
+                plot(ax3, scf.centers/S.rp, scf.correction, 'c', 'LineWidth', 2);
 				xlim(ax3,[(S.br-potdepth)/(S.rp) S.br/(S.rp)])
                 % SNR PLOT
-                bar(ax4, scf_centers/S.rp, snr);
+                bar(ax4, scf.centers/S.rp, snr);
 				hold(ax4, 'on');				
                 yline(ax4, sigmadrift, '-r');
 				yline(ax4, -sigmadrift, '-r');
@@ -318,8 +412,43 @@ while exitflag==false
                 ndens.counts(:) = 0;	
                 pdf.counts(:) = 0;
             end
+			if graphing
+				batch_count = batch_count + 1;
+				correction_history(:, batch_count) = scf.correction;
+
+				% --- Plot 1: Modal Spectrum (Upper Left) ---
+				cla(ax_spec); hold(ax_spec, 'on');
+				colors = jet(scf.bins);
+				for ib = 1:numel(scf.modes.bins)
+                    ibi=scf.modes.bins(ib);
+					plot(ax_spec, modal_lines(ibi).r/S.rp, modal_lines(ibi).u, ...
+						 'Color', colors(ibi,:), 'LineWidth', 1.5, ...
+						 'DisplayName', ['k=' num2str(modal_lines(ibi).k)]);
+				end
+				grid(ax_spec, 'on'); set(ax_spec, 'XColor', 'w', 'YColor', 'w');
+				ylabel(ax_spec, 'Update Mag');
+
+				% --- Plot 2: Residual vs Correction (Upper Right) ---
+				% We compare the raw evidence (Flux) with the cumulative potential built (Correction)
+				cla(ax_res); hold(ax_res, 'on');
+				% Normalize for visualization if orders of magnitude differ
+				plot(ax_res, scf.centers/S.rp, high_res_flux, 'y', 'LineWidth', 2, 'DisplayName', 'Raw Flux');
+				plot(ax_res, scf.centers/S.rp, scf.correction, 'c--', 'LineWidth', 1.5, 'DisplayName', 'Total Corr');
+				legend(ax_res, 'TextColor', 'w', 'Location', 'best');
+				grid(ax_res, 'on'); set(ax_res, 'XColor', 'w', 'YColor', 'w');
+
+				% --- Plot 3: Stability Heatmap (Bottom) ---
+				% X is batch number, Y is Radius
+				imagesc(ax_heat, 1:batch_count, scf.centers/S.rp, correction_history(:, 1:batch_count));
+				colormap(ax_heat, parula); colorbar(ax_heat, 'Color', 'w');
+				xlabel(ax_heat, 'Batch Number'); ylabel(ax_heat, 'Radius (r/rp)');
+				set(ax_heat, 'XColor', 'w', 'YColor', 'w');
+				title(ax_heat, 'Correction History (Stability Check)', 'Color', 'w');
+
+				drawnow;
+			end
 			check_interval=floor(check_interval_growth_factor*check_interval);
-			if check_interval>check_interval_maxsteps;
+			if check_interval>check_interval_maxsteps
 				check_interval=check_interval_maxsteps;
 				exitflag=1;
 			end
@@ -386,10 +515,10 @@ while exitflag==false
     if qs > 1e6, fprintf('Internal safety limit (1e6) reached.\n'); break; end
 end
 
-ASYMCORR.correction = [scf_centers, scf_correction];
+ASYMCORR.correction = [scf.centers, scf.correction];
 ASYMCORR.history = history; ASYMCORR.S=S;
 if enable_io
-    save([data_folder,'\',filenamecorrection], 'ASYMCORR', 'scf_edges');
+    save([data_folder,'\',filenamecorrection], 'ASYMCORR', 'scf.edges');
     save([data_folder,'\',filestartingconfiguration], 'p', 'pgp', 'S');
 end
 disp('SGD V10 Complete.');
